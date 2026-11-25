@@ -1,0 +1,330 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                    Int                    @id @default(autoincrement())
+  email                 String                 @unique
+  passwordHash          String
+  firstName             String
+  lastName              String
+  role                  Role                   @default(USER)
+  isActive              Boolean                @default(true)
+  mustChangePassword    Boolean                @default(false)
+  tokenVersion          Int                    @default(0)
+  chatSessions          ChatSession[]
+  simulationAttempts    SimulationAttempt[]
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @updatedAt
+  refreshTokens         RefreshToken[]
+  sessionState          UserSessionState?
+  policyEvents          PolicyEvent[]
+  sessionRestrictions   SessionRestriction[]
+  policyConversations   PolicyConversation[]
+  policyConfigsUpdated  PolicyConfig[]         @relation("PolicyConfigUpdatedBy")
+  policyRulesCreated    PolicyRule[]           @relation("PolicyRuleCreatedBy")
+  simulationSessions    SimulationSession[]
+  simulationCompletions SimulationCompletion[]
+  simulationDrafts SimulationDraft[]
+  chatTurns ChatTurn[]
+  adminSecurity AdminSecurity?
+}
+
+model SecurityLease {
+  id String @id
+  userId Int
+  expiresAt DateTime
+  @@index([expiresAt])
+}
+
+model AdminSecurity {
+  userId Int @id
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  secret String?
+  pendingSecret String?
+  pendingExpiresAt DateTime?
+  lastCounter BigInt @default(-1)
+  recoveryHashes Json @default("[]")
+}
+
+model RefreshToken {
+  id        Int      @id @default(autoincrement())
+  token     String   @unique
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model UserSessionState {
+  id        Int      @id @default(autoincrement())
+  userId    Int      @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessions  Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model PolicyConversation {
+  id        String   @id @default(cuid())
+  userId    Int
+  sessionId String
+  scope     String
+  history   Json     @default("[]")
+  expiresAt DateTime @default(now())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, sessionId])
+  @@index([userId, updatedAt])
+  @@index([expiresAt])
+}
+
+model PolicyConfig {
+  id          Int      @id @default(1)
+  messages    Json
+  version     Int      @default(1)
+  updatedById Int?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  updatedBy   User?    @relation("PolicyConfigUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+}
+
+model PolicyRule {
+  id          String         @id @default(cuid())
+  type        PolicyRuleType
+  value       String
+  position    Int            @default(0)
+  enabled     Boolean        @default(true)
+  createdById Int?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  createdBy   User?          @relation("PolicyRuleCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@unique([type, value])
+  @@index([type, enabled, position])
+}
+
+model SimulationModule {
+  revision              Int                    @default(1)
+  createdById           Int?
+  updatedById           Int?
+  publishedAt           DateTime?
+  id                    String                 @id
+  title                 String
+  category              String
+  difficulty            String
+  simulation            Json?
+  enabled               Boolean                @default(true)
+  completions           Int                    @default(0)
+  passRate              Float                  @default(0)
+  avgSteps              Float                  @default(0)
+  sourcePrompt          String?
+  createdAt             DateTime               @default(now())
+  updatedAt             DateTime               @updatedAt
+  simulationSessions    SimulationSession[]
+  simulationCompletions SimulationCompletion[]
+}
+
+model SimulationCompletion {
+  id             String           @id @default(cuid())
+  userId         Int
+  moduleId       String
+  attemptKey     String           @unique
+  surface        String
+  stepsCompleted Int
+  verification   String           @default("self-reported")
+  completedAt    DateTime         @default(now())
+  user           User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  module         SimulationModule @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+
+  @@index([moduleId, completedAt])
+  @@index([userId, completedAt])
+}
+
+model SimulationSession {
+  id            String                  @id @default(cuid())
+  userId        Int
+  moduleId      String
+  chatSessionId String?
+  surface       String
+  status        SimulationSessionStatus @default(PROVISIONING)
+  ec2InstanceId String?                 @unique
+  privateIp     String?
+  credential    String?
+  expiresAt     DateTime
+  endedAt       DateTime?
+  createdAt     DateTime                @default(now())
+  updatedAt     DateTime                @updatedAt
+  user          User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  module        SimulationModule        @relation(fields: [moduleId], references: [id], onDelete: Restrict)
+
+  @@index([userId, status])
+  @@index([status, expiresAt])
+  @@index([userId, chatSessionId])
+}
+
+model PolicyEvent {
+  id         String   @id @default(cuid())
+  at         DateTime @default(now())
+  userId     Int?
+  userEmail  String
+  message    String
+  blocked    Boolean  @default(false)
+  code       String
+  reason     String
+  hasHistory Boolean  @default(false)
+  sessionId  String?
+  requestId  String?
+  outcome    String?
+  stage      String?
+  metadata   Json?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([at(sort: Desc)])
+  @@index([blocked, at(sort: Desc)])
+  @@index([code])
+  @@index([userId, sessionId, at])
+}
+
+model SessionRestriction {
+  userId       Int
+  sessionId    String
+  windowStart  DateTime @default(now())
+  violations   Int      @default(0)
+  expiresAt    DateTime?
+  reason       String?
+  updatedAt    DateTime @updatedAt
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@id([userId, sessionId])
+  @@index([expiresAt])
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum SimulationSessionStatus {
+  PROVISIONING
+  READY
+  ACTIVE
+  TERMINATING
+  ENDED
+  FAILED
+}
+
+enum PolicyRuleType {
+  SAFETY_BLOCK_KEYWORD
+  GREETING_PATTERN
+  IN_SCOPE_KEYWORD
+  OUT_OF_SCOPE_KEYWORD
+  IN_SCOPE_INTENT
+}
+
+model ChatSession {
+  version Int @default(1)
+  userId Int
+  id String
+  data Json
+  updatedAt DateTime @updatedAt
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@id([userId, id])
+  @@index([updatedAt])
+}
+model RequestLimit {
+  key String @id
+  hits Int
+  resetAt DateTime
+  @@index([resetAt])
+}
+model AdminAuditLog {
+  id BigInt @id @default(autoincrement())
+  actorId Int
+  method String
+  path String
+  status Int
+  metadata Json?
+  at DateTime @default(now())
+  @@index([at])
+}
+model PromptInsightDismissal {
+  key String @id
+  createdAt DateTime @default(now())
+}
+
+model SimulationAttempt {
+  id String @id @default(cuid())
+  userId Int
+  moduleId String
+  surface String
+  expected Json
+  nextStep Int @default(0)
+  mistakes Int @default(0)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@index([userId, expiresAt])
+}
+
+model SimulationDraft {
+  id String @id @default(cuid())
+  ownerId Int
+  owner User @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  moduleId String?
+  title String
+  category String
+  difficulty String @default("Medium")
+  sourcePrompt String?
+  simulation Json
+  generation Json?
+  state String @default("DRAFT")
+  version Int @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([ownerId, state, updatedAt])
+}
+
+model SimulationRevision {
+  id String @id @default(cuid())
+  moduleId String
+  revision Int
+  actorId Int?
+  snapshot Json
+  testReceiptId String?
+  createdAt DateTime @default(now())
+  @@unique([moduleId, revision])
+  @@index([moduleId, createdAt])
+}
+
+model SimulationTestReceipt {
+  id String @id @default(cuid())
+  actorId Int
+  definitionHash String
+  definition Json
+  events Json
+  mistakes Int
+  stepsCompleted Int
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  @@index([actorId, createdAt])
+}
+
+model ChatTurn {
+  id String @id @default(cuid())
+  userId Int
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessionId String
+  userMessageId String
+  assistantMessageId String
+  message String
+  reply String
+  createdAt DateTime @default(now())
+  @@index([userId, sessionId, createdAt])
+}

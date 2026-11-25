@@ -1,0 +1,2894 @@
+import AuditLogPage from './AuditLogPage';
+import AdminSecurityGate from './AdminSecurityGate';
+import { useDraftAutosave } from './useDraftAutosave';
+import ModuleRevisionHistory from './ModuleRevisionHistory';
+import ModalCloseButton from '../../components/ModalCloseButton';
+import { passwordAllowed } from "../../utils/passwordPolicy";
+import { plainDescription } from "../../utils/plainDescription";
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  BarElement,
+  CategoryScale,
+  Chart as ChartJS,
+  Filler,
+  LinearScale,
+  LineElement,
+  PointElement,
+  Tooltip
+} from "chart.js";
+import { Bar, Line } from "react-chartjs-2";
+import { useAuth } from "../../hooks/useAuth";
+import { useAxios } from "../../hooks/useAxios";
+import TerminalModuleTester from "./TerminalModuleTester";
+import DesktopModuleEditor from "./DesktopModuleEditor";
+import TerminalEmulator from "../users/Modules/TerminalEmulator";
+import WindowsOsSimulation from "../users/Modules/WindowsOsSimulation";
+import macOsPreviewImg from "../../IMG/MAC.jpg";
+import windowsOsPreviewImg from "../../IMG/WIN 11.webp";
+import helpdeskLogo from "../../IMG/HELPDESKAI.png";
+import "./admin.css";
+import "./admin-workspace.css";
+
+const POLICY_OUTCOME_LABELS = { ALLOWED: "Allowed", REDIRECTED: "Redirected", BLOCKED: "Blocked", OUTPUT_FILTERED: "Output filtered", UNAVAILABLE: "Unavailable" };
+function outcomeBadge(event) { return event.outcome === "BLOCKED" ? "badge-blocked" : event.outcome === "ALLOWED" ? "badge-allowed" : "badge-policy-neutral"; }
+function outcomeLabel(event) { return POLICY_OUTCOME_LABELS[event.outcome] || (event.blocked ? "Blocked" : "Allowed"); }
+const PAGE_META = {
+  overview: { title: "Overview", nav: "Overview" },
+  users: { title: "User Management", nav: "User Management" },
+  policy: { title: "Policy Monitor", nav: "Policy Monitor" },
+  sims: { title: "Simulation Modules", nav: "Simulation Modules" },
+  audit: { title: "Audit Log", nav: "Audit Log" }
+};
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PASSWORD_REGEX = { test: passwordAllowed };
+function generateUserPassword() { return "password123"; }
+const USERS_PER_PAGE = 8;
+const POLICY_EVENTS_PER_PAGE = 10;
+const POLICY_LIST_META = {
+  greetingPatterns: "Greeting Phrases",
+  inScopeKeywords: "In-Scope Keywords",
+  outOfScopeKeywords: "Out-of-Scope Keywords",
+  safetyBlockedKeywords: "Safety Blocks",
+  inScopeIntentPatterns: "In-Scope Intent Phrases"
+};
+const POLICY_LIST_HELP = {
+  safetyBlockedKeywords: "Matching words or phrases block requests before IT classification, including IT questions. Edit or delete any keyword below. Case and extra spacing are ignored. Blocked user requests count toward the session cooldown.",
+  greetingPatterns: "A greeting-only message matching a configured phrase receives your greeting reply after safety checks. Case, spacing, and trailing ! . ? are ignored. Messages with an added question are classified normally.",
+  inScopeKeywords: "Classifier guidance: all saved terms help identify IT support requests. A matching term does not automatically allow a request or bypass safety checks.",
+  outOfScopeKeywords: "Classifier guidance, not an exact blocklist: all saved topics help identify unrelated requests. Legitimate IT problems involving these topics can still be allowed.",
+  inScopeIntentPatterns: "Classifier guidance: all saved phrases help recognize troubleshooting intent in context. A phrase alone does not automatically allow a request."
+};
+const POLICY_LIST_PLACEHOLDERS = {
+  safetyBlockedKeywords: "Enter a restricted word or phrase",
+  greetingPatterns: "Example: good morning",
+  inScopeKeywords: "Example: network adapter",
+  outOfScopeKeywords: "Example: restaurant recommendation",
+  inScopeIntentPatterns: "Example: unable to connect"
+};
+const THEME_STORAGE_KEY = "helpdesk_simulation_theme_v2";
+
+ChartJS.register(
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  BarElement,
+  Tooltip,
+  Filler
+);
+
+function buildDefaultUserForm() {
+  return {
+    firstName: "",
+    lastName: "",
+    email: "",
+    password: "",
+    confirmPassword: "",
+    role: "USER",
+    isActive: true
+  };
+}
+
+function startOfToday() {
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  return now.getTime();
+}
+
+function startOfWeek() {
+  const now = new Date();
+  const day = now.getDay();
+  const diff = (day + 6) % 7;
+  now.setDate(now.getDate() - diff);
+  now.setHours(0, 0, 0, 0);
+  return now.getTime();
+}
+
+function formatDateTime(value) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "-";
+  }
+  return parsed.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
+function formatRelative(value) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "-";
+  }
+
+  const diffMs = Date.now() - parsed.getTime();
+  const diffMin = Math.floor(diffMs / 60000);
+  if (diffMin < 1) return "Just now";
+  if (diffMin < 60) return `${diffMin}m ago`;
+
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+
+  const diffDay = Math.floor(diffHr / 24);
+  if (diffDay < 7) return `${diffDay}d ago`;
+
+  return parsed.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function safeError(error) {
+  if (!error?.response) {
+    return "Connection error. Please try again.";
+  }
+  return error.response.data?.message || "Request failed.";
+}
+
+function stripHtml(value = "") {
+  return String(value || "").replace(/<[^>]+>/g, "").trim();
+}
+
+function normalizeSurface(surface = "", terminalType = "") {
+  const value = String(surface || "").toLowerCase();
+  if (["windows-terminal", "mac-terminal", "windows-os", "mac-os"].includes(value)) return value;
+  return String(terminalType || "").toLowerCase() === "mac-terminal" ? "mac-terminal" : "windows-terminal";
+}
+
+function formatSurfaceLabel(surface = "") {
+  const value = String(surface || "").toLowerCase();
+  if (value === "mac-terminal") return "Mac Terminal";
+  if (value === "windows-os") return "Windows OS";
+  if (value === "mac-os") return "Mac OS";
+  return "Windows Terminal";
+}
+
+function toCsv(rows) {
+  return rows
+    .map((row) =>
+      row
+        .map((cell) => {
+          const text = String(cell ?? "").replaceAll('"', '""');
+          return `"${text}"`;
+        })
+        .join(",")
+    )
+    .join("\n");
+}
+
+function downloadCsv(filename, rows) {
+  const blob = new Blob([toCsv(rows)], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+function validateUserForm(mode, form, { allowDefaultPassword = false } = {}) {
+
+
+  if (!form.firstName.trim()) return "First name is required.";
+  if (!form.lastName.trim()) return "Last name is required.";
+  if (!EMAIL_REGEX.test(form.email.trim())) return "Enter a valid email address.";
+
+  if (mode === "create") {
+    if (!(allowDefaultPassword && form.password === "password123") && !PASSWORD_REGEX.test(form.password)) {
+      return "Password must be at least 12 characters, at most 72 UTF-8 bytes, and not a common password.";
+    }
+    if (form.password !== form.confirmPassword) {
+      return "Passwords do not match.";
+    }
+  }
+
+  if (mode === "edit" && form.password) {
+    if (!PASSWORD_REGEX.test(form.password)) {
+      return "Password must be at least 12 characters, at most 72 UTF-8 bytes, and not a common password.";
+    }
+    if (form.password !== form.confirmPassword) {
+      return "Passwords do not match.";
+    }
+  }
+
+  return "";
+}
+
+function buildFallbackSimulationDefinition(module) {
+  const title = String(module?.title || "Simulation Scenario").trim();
+  const category = String(module?.category || "General").trim();
+  return {
+    title,
+    scenarioType: "general",
+    surface: "windows-terminal",
+    terminalType: "windows-terminal",
+    steps: [
+      {
+        title: "Collect Incident Context",
+        desc: `Capture issue details for <b>${title}</b>.`,
+        screen: `> Ticket opened\n> Category: ${category}\n> Scenario: ${title}`,
+        action: "Verify impact and reproduction details.",
+        result: "Incident context documented."
+      },
+      {
+        title: "Run Baseline Checks",
+        desc: "Perform baseline diagnostics to isolate the fault domain.",
+        screen: "> Baseline checks in progress...\n> Service / connectivity / logs reviewed",
+        action: "Use safe checks before any remediation.",
+        result: "Initial diagnostics completed."
+      },
+      {
+        title: "Apply Corrective Action",
+        desc: "Execute an approved remediation sequence.",
+        screen: "> Corrective commands executed\n> Change log updated",
+        action: "Apply one change at a time and monitor output.",
+        result: "Remediation applied."
+      },
+      {
+        title: "Validate Recovery",
+        desc: "Confirm service restoration and user-facing recovery.",
+        screen: "> Validation tests passed\n> User confirmation received",
+        action: "Run post-fix checks and confirm no regression.",
+        result: "Recovery confirmed."
+      },
+      {
+        title: "Document and Close",
+        desc: "Capture root cause, fix summary, and preventive notes.",
+        screen: "> Ticket notes updated\n> Closure summary saved",
+        action: "Record lessons learned and close ticket.",
+        result: "Simulation completed."
+      }
+    ]
+  };
+}
+
+function getModuleSimulationDefinition(module) {
+  const candidate = module?.simulation;
+  if (candidate && Array.isArray(candidate.steps) && candidate.steps.length > 0) {
+    return candidate;
+  }
+  return buildFallbackSimulationDefinition(module);
+}
+
+function NavIcon({ id }) {
+  if(id==='audit')return <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3h11v18H5V7M8 3v4H5M9 11h6M9 15h6" /></svg>;
+  if (id === "overview") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3 13h8V3H3zM13 21h8v-8h-8zM13 3h8v6h-8zM3 21h8v-6H3z" />
+      </svg>
+    );
+  }
+  if (id === "users") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M16 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM8 12a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" />
+        <path d="M2 21a6 6 0 0 1 12 0M12 21a7 7 0 0 1 10 0" />
+      </svg>
+    );
+  }
+  if (id === "policy") {
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M12 3l8 4v6c0 5-3.3 7.9-8 8-4.7-.1-8-3-8-8V7l8-4z" />
+        <path d="M9 12l2 2 4-4" />
+      </svg>
+    );
+  }
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4 7h16M4 12h8M4 17h12" />
+      <path d="M17 12h3v5h-3z" />
+    </svg>
+  );
+}
+
+function PaginationControls({ page, pageCount, total, itemLabel, onPageChange }) {
+  if (pageCount <= 1) {
+    return <div className="pagination pagination-single"><span>{total} {itemLabel}</span></div>;
+  }
+
+  const firstPage = Math.max(1, Math.min(page - 2, pageCount - 4));
+  const lastPage = Math.min(pageCount, firstPage + 4);
+  const pages = Array.from({ length: lastPage - firstPage + 1 }, (_, index) => firstPage + index);
+
+  return (
+    <div className="pagination pagination-controls">
+      <span className="pagination-summary">Showing {total} {itemLabel} · Page {page} of {pageCount}</span>
+      <div className="pagination-buttons" aria-label={`${itemLabel} pagination`}>
+        <button type="button" className="pagination-btn" onClick={() => onPageChange(page - 1)} disabled={page === 1}>Previous</button>
+        {firstPage > 1 ? <><button type="button" className="pagination-btn" onClick={() => onPageChange(1)}>1</button><span className="pagination-ellipsis">…</span></> : null}
+        {pages.map((pageNumber) => (
+          <button
+            key={pageNumber}
+            type="button"
+            className={`pagination-btn pagination-number ${pageNumber === page ? "active" : ""}`}
+            onClick={() => onPageChange(pageNumber)}
+            aria-current={pageNumber === page ? "page" : undefined}
+          >
+            {pageNumber}
+          </button>
+        ))}
+        {lastPage < pageCount ? <><span className="pagination-ellipsis">…</span><button type="button" className="pagination-btn" onClick={() => onPageChange(pageCount)}>{pageCount}</button></> : null}
+        <button type="button" className="pagination-btn" onClick={() => onPageChange(page + 1)} disabled={page === pageCount}>Next</button>
+      </div>
+    </div>
+  );
+}
+
+function PasswordVisibilityIcon({ visible }) {
+  return visible ? (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="m3 3 18 18" />
+      <path d="M10.6 10.6a2 2 0 0 0 2.8 2.8" />
+      <path d="M9.4 5.2A10.7 10.7 0 0 1 12 5c5 0 8.9 3.1 10 7-0.5 1.5-1.4 2.8-2.6 3.9" />
+      <path d="M6.3 6.3C4.4 7.6 3.1 9.5 2 12c1.1 3.9 5 7 10 7 1.2 0 2.4-0.2 3.5-0.6" />
+    </svg>
+  ) : (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M2 12s3.8-7 10-7 10 7 10 7-3.8 7-10 7S2 12 2 12z" />
+      <circle cx="12" cy="12" r="3" />
+    </svg>
+  );
+}
+
+function SimulationEmptyState({ type, title, message }) {
+  const isQueue = type === "queue";
+  return (
+    <div className="simulation-empty-state">
+      <svg className="simulation-empty-illustration" viewBox="0 0 120 88" aria-hidden="true">
+        <rect x="20" y="18" width="80" height="52" rx="6" fill="none" stroke="currentColor" strokeWidth="2" />
+        {isQueue ? (
+          <>
+            <path d="M37 36h46M37 46h34M37 56h24" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+            <circle cx="88" cy="57" r="11" fill="var(--color-background-secondary)" stroke="currentColor" strokeWidth="2" />
+            <path d="M88 52v6M88 63h.01" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+          </>
+        ) : (
+          <>
+            <path d="M36 31h48v27H36z" fill="none" stroke="currentColor" strokeWidth="2" />
+            <path d="M45 64h30M60 58v6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+            <path d="M49 40h22M49 48h14" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+          </>
+        )}
+      </svg>
+      <strong>{title}</strong>
+      <span>{message}</span>
+    </div>
+  );
+}
+
+export default function AdminPage() { return <AdminSecurityGate><AdminPageContent /></AdminSecurityGate>; }
+function AdminPageContent() {
+  const { user, logout, refreshAccessToken } = useAuth();
+  const api = useAxios();
+  const profileMenuRef = useRef(null);
+  const userActionNoticeTimerRef = useRef(null);
+  const userActionErrorTimerRef = useRef(null);
+
+  const [activePage, setActivePage] = useState("overview");
+  const [theme, setTheme] = useState("light");
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
+  const [accountSettingsOpen, setAccountSettingsOpen] = useState(false);
+  const [accountPasswordForm, setAccountPasswordForm] = useState({ currentPassword: "", newPassword: "", confirmPassword: "" });
+  const [accountPasswordVisibility, setAccountPasswordVisibility] = useState({ current: false, next: false, confirm: false });
+  const [accountSettingsError, setAccountSettingsError] = useState("");
+  const [accountSettingsSuccess, setAccountSettingsSuccess] = useState("");
+  const [accountPasswordSaving, setAccountPasswordSaving] = useState(false);
+  const [users, setUsers] = useState([]);
+  const [policySummary, setPolicySummary] = useState({ total: 0, blocked: 0, allowed: 0, blockRate: 0, last24h: 0, byCode: {} });
+  const [policyEvents, setPolicyEvents] = useState([]);
+  const [modules, setModules] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [pendingKey, setPendingKey] = useState("");
+  const [userActionNotice, setUserActionNotice] = useState("");
+  const [userActionErrorNotice, setUserActionErrorNotice] = useState("");
+
+  const [userQuery, setUserQuery] = useState("");
+  const [userRoleFilter, setUserRoleFilter] = useState("ALL");
+  const [userStatusFilter, setUserStatusFilter] = useState("ALL");
+  const [userPage, setUserPage] = useState(1);
+
+  const [policyStatusFilter, setPolicyStatusFilter] = useState("ALL");
+  const [policyTimeFilter, setPolicyTimeFilter] = useState("ALL");
+  const [policyWorkspaceTab, setPolicyWorkspaceTab] = useState("decisions");
+  const [policyConfigTab, setPolicyConfigTab] = useState("rules");
+  const [policyConfigListKey, setPolicyConfigListKey] = useState("greetingPatterns");
+  const [policyConfig, setPolicyConfig] = useState({
+    greetingPatterns: [],
+    inScopeKeywords: [],
+    outOfScopeKeywords: [],
+    safetyBlockedKeywords: [],
+    inScopeIntentPatterns: [],
+    messages: {}
+  });
+  const [policyConfigDraft, setPolicyConfigDraft] = useState({});
+  const [policyEditorError, setPolicyEditorError] = useState("");
+  const [policyEditorListInput, setPolicyEditorListInput] = useState({});
+  const [policyConfigSearchMap, setPolicyConfigSearchMap] = useState({});
+  const [policyActionSuccess, setPolicyActionSuccess] = useState(null);
+  const [policyEntryEditor, setPolicyEntryEditor] = useState(null);
+  const [policyActionConfirmation, setPolicyActionConfirmation] = useState(null);
+
+  const [policyQuery, setPolicyQuery] = useState("");
+  const [policyCodeFilter, setPolicyCodeFilter] = useState("ALL");
+  const [policyPage, setPolicyPage] = useState(1);
+  const [selectedPolicyEvent, setSelectedPolicyEvent] = useState(null);
+  const [promptInsights, setPromptInsights] = useState([]);
+  const [promptInsightsLoading, setPromptInsightsLoading] = useState(false);
+  const [promptInsightsError, setPromptInsightsError] = useState("");
+  const [promptInsightQuery, setPromptInsightQuery] = useState("");
+  const [simulationView, setSimulationView] = useState("modules");
+  const [moduleStatusFilter, setModuleStatusFilter] = useState("all");
+  const [modulePreview, setModulePreview] = useState(null);
+  const [modulePreviewStep, setModulePreviewStep] = useState(0);
+  const [modulePreviewSurface, setModulePreviewSurface] = useState("windows-terminal");
+  const [moduleDraftMeta, setModuleDraftMeta] = useState(null);
+  const [savedDrafts,setSavedDrafts]=useState([]);
+  const draftAutosave=useDraftAutosave(api);
+  const [moduleDraftError, setModuleDraftError] = useState("");
+  const [adminWindowsOsTest, setAdminWindowsOsTest] = useState(null);
+  const [userModalOpen, setUserModalOpen] = useState(false);
+  const [userModalMode, setUserModalMode] = useState("create");
+  const [editingUserId, setEditingUserId] = useState(null);
+  const [userPendingDeletion, setUserPendingDeletion] = useState(null);
+  const [userForm, setUserForm] = useState(buildDefaultUserForm());
+  const [useDefaultPassword, setUseDefaultPassword] = useState(false);
+  const [generatedUserPassword, setGeneratedUserPassword] = useState("");
+  const [showCreatePassword, setShowCreatePassword] = useState(false);
+  const [showCreateConfirmPassword, setShowCreateConfirmPassword] = useState(false);
+  const [userFormError, setUserFormError] = useState("");
+
+  const loadUsers = useCallback(async () => {
+    const res = await api.get("/api/admin/users");
+    setUsers(Array.isArray(res.data?.users) ? res.data.users : []);
+  }, [api]);
+
+  const [safetyRules, setSafetyRules] = useState(null);
+
+  const loadPolicy = useCallback(async () => {
+    const [summaryRes, eventsRes, configRes] = await Promise.all([
+      api.get("/api/admin/policy/summary"),
+      api.get("/api/admin/policy/events?limit=1000"),
+      api.get("/api/admin/policy/config")
+    ]);
+
+    setPolicySummary(summaryRes.data?.summary || { total: 0, blocked: 0, allowed: 0, blockRate: 0, last24h: 0, byCode: {} });
+    setPolicyEvents(Array.isArray(eventsRes.data?.events) ? eventsRes.data.events : []);
+    setSafetyRules(configRes.data?.safetyRules || null);
+    const nextConfig = configRes.data?.config || {
+      greetingPatterns: [],
+      inScopeKeywords: [],
+      outOfScopeKeywords: [],
+      safetyBlockedKeywords: [],
+      inScopeIntentPatterns: [],
+      messages: {}
+    };
+    setPolicyConfig(nextConfig);
+    setPolicyConfigDraft(nextConfig.messages || {});
+    setPolicyEditorError("");
+  }, [api]);
+
+  const loadModules = useCallback(async () => {
+    const [res,draftsRes] = await Promise.all([api.get("/api/admin/simulation-modules"),api.get("/api/admin/simulation-drafts")]);
+    setSavedDrafts(draftsRes.data?.drafts || []);
+    setModules(Array.isArray(res.data?.modules) ? res.data.modules : []);
+  }, [api]);
+
+  const loadPromptInsights = useCallback(async () => {
+    setPromptInsightsLoading(true);
+    setPromptInsightsError("");
+    try {
+      const res = await api.get("/api/admin/simulation-modules/prompt-insights?limit=200");
+      setPromptInsights(Array.isArray(res.data?.insights) ? res.data.insights : []);
+    } catch (err) {
+      setPromptInsightsError(safeError(err));
+    } finally {
+      setPromptInsightsLoading(false);
+    }
+  }, [api]);
+
+  const loadAll = useCallback(async () => {
+    try {
+      setLoading(true);
+      setError("");
+      await Promise.all([loadUsers(), loadPolicy(), loadModules(), loadPromptInsights()]);
+    } catch (err) {
+      setError(safeError(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [loadModules, loadPolicy, loadPromptInsights, loadUsers]);
+
+  useEffect(() => {
+    loadAll();
+  }, [loadAll]);
+
+  useEffect(() => {
+    const saved = localStorage.getItem(THEME_STORAGE_KEY);
+    if (saved === "dark" || saved === "light") {
+      setTheme(saved);
+    }
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(THEME_STORAGE_KEY, theme);
+  }, [theme]);
+
+  useEffect(() => {
+    const onPointerDown = (event) => {
+      if (!profileMenuRef.current?.contains(event.target)) {
+        setProfileMenuOpen(false);
+      }
+    };
+    const onEscape = (event) => {
+      if (event.key === "Escape") {
+        setProfileMenuOpen(false);
+        setAccountSettingsOpen(false);
+        setSelectedPolicyEvent(null);
+        setPolicyActionSuccess(null);
+        setPolicyEntryEditor(null);
+        setPolicyActionConfirmation(null);
+      }
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onEscape);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onEscape);
+    };
+  }, []);
+
+  useEffect(() => () => {
+    if (userActionNoticeTimerRef.current) {
+      window.clearTimeout(userActionNoticeTimerRef.current);
+    }
+    if (userActionErrorTimerRef.current) {
+      window.clearTimeout(userActionErrorTimerRef.current);
+    }
+  }, []);
+
+  const userStats = useMemo(() => {
+    const total = users.length;
+    const active = users.filter((u) => u.isActive).length;
+    const admins = users.filter((u) => u.role === "ADMIN").length;
+    return { total, active, admins };
+  }, [users]);
+
+  const moduleStats = useMemo(() => {
+    const total = modules.length;
+    const enabled = modules.filter((m) => m.enabled).length;
+    const completions = modules.reduce((sum, m) => sum + Number(m.completions || 0), 0);
+    return { total, enabled, completions };
+  }, [modules]);
+
+  const todayStart = useMemo(() => startOfToday(), []);
+  const weekStart = useMemo(() => startOfWeek(), []);
+
+  const aiChatsToday = useMemo(
+    () => policyEvents.filter((event) => new Date(event.at).getTime() >= todayStart).length,
+    [policyEvents, todayStart]
+  );
+
+  const blockedToday = policySummary.today?.blocked ?? 0;
+
+  const filteredUsers = useMemo(() => {
+    const query = userQuery.trim().toLowerCase();
+
+    return users.filter((u) => {
+      if (String(u.id) === String(user?.id)) return false;
+
+      const fullName = `${u.firstName || ""} ${u.lastName || ""}`.trim().toLowerCase();
+      const email = String(u.email || "").toLowerCase();
+      const matchesQuery = !query || fullName.includes(query) || email.includes(query);
+      const matchesRole = userRoleFilter === "ALL" || u.role === userRoleFilter;
+      const matchesStatus =
+        userStatusFilter === "ALL" ||
+        (userStatusFilter === "ACTIVE" && u.isActive) ||
+        (userStatusFilter === "INACTIVE" && !u.isActive);
+
+      return matchesQuery && matchesRole && matchesStatus;
+    });
+  }, [userQuery, userRoleFilter, userStatusFilter, users, user?.id]);
+
+  const filteredPolicyEvents = useMemo(() => {
+    const query = policyQuery.trim().toLowerCase();
+    return policyEvents.filter((event) => {
+      const at = new Date(event.at).getTime();
+      const statusPass =
+        policyStatusFilter === "ALL" ||
+        (policyStatusFilter === "ALLOWED" && !event.blocked) ||
+        (policyStatusFilter === "BLOCKED" && event.blocked);
+
+      const timePass =
+        policyTimeFilter === "ALL" ||
+        (policyTimeFilter === "TODAY" && at >= todayStart) ||
+        (policyTimeFilter === "WEEK" && at >= weekStart);
+      const codePass = policyCodeFilter === "ALL" || (event.code || "UNKNOWN") === policyCodeFilter;
+      const queryPass =
+        !query ||
+        String(event.userEmail || "").toLowerCase().includes(query) ||
+        String(event.message || "").toLowerCase().includes(query) ||
+        String(event.reason || "").toLowerCase().includes(query) ||
+        String(event.code || "").toLowerCase().includes(query);
+
+      return statusPass && timePass && codePass && queryPass;
+    });
+  }, [policyEvents, policyStatusFilter, policyTimeFilter, todayStart, weekStart, policyCodeFilter, policyQuery]);
+
+  const userPageCount = Math.max(1, Math.ceil(filteredUsers.length / USERS_PER_PAGE));
+  const policyPageCount = Math.max(1, Math.ceil(filteredPolicyEvents.length / POLICY_EVENTS_PER_PAGE));
+  const paginatedUsers = useMemo(
+    () => filteredUsers.slice((userPage - 1) * USERS_PER_PAGE, userPage * USERS_PER_PAGE),
+    [filteredUsers, userPage]
+  );
+  const paginatedPolicyEvents = useMemo(
+    () => filteredPolicyEvents.slice((policyPage - 1) * POLICY_EVENTS_PER_PAGE, policyPage * POLICY_EVENTS_PER_PAGE),
+    [filteredPolicyEvents, policyPage]
+  );
+
+  useEffect(() => {
+    setUserPage(1);
+  }, [userQuery, userRoleFilter, userStatusFilter]);
+
+  useEffect(() => {
+    setPolicyPage(1);
+  }, [policyQuery, policyCodeFilter, policyStatusFilter, policyTimeFilter]);
+
+  useEffect(() => {
+    setUserPage((current) => Math.min(current, userPageCount));
+  }, [userPageCount]);
+
+  useEffect(() => {
+    setPolicyPage((current) => Math.min(current, policyPageCount));
+  }, [policyPageCount]);
+
+  const aiResponseWeekChart = useMemo(() => {
+    const weekStartDate = new Date();
+    weekStartDate.setHours(0, 0, 0, 0);
+    weekStartDate.setDate(weekStartDate.getDate() - weekStartDate.getDay());
+    const points = Array.from({ length: 7 }).map((_, index) => {
+      const dayStart = new Date(weekStartDate);
+      dayStart.setDate(dayStart.getDate() + index);
+      const dayEnd = new Date(dayStart);
+      dayEnd.setDate(dayEnd.getDate() + 1);
+      const count = policyEvents.filter((event) => {
+        const at = new Date(event.at).getTime();
+        return at >= dayStart.getTime() && at < dayEnd.getTime();
+      }).length;
+      return {
+        label: dayStart.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" }),
+        count
+      };
+    });
+    const weekEndDate = new Date(weekStartDate);
+    weekEndDate.setDate(weekEndDate.getDate() + 6);
+    const dateFormat = { month: "short", day: "numeric", year: "numeric" };
+    return {
+      dateRange: `${weekStartDate.toLocaleDateString([], dateFormat)} – ${weekEndDate.toLocaleDateString([], dateFormat)}`,
+      labels: points.map((point) => point.label),
+      counts: points.map((point) => point.count)
+    };
+  }, [policyEvents]);
+
+  const policyCodeOptions = useMemo(() => {
+    const codes = new Set(policyEvents.map((event) => event.code || "UNKNOWN"));
+    return ["ALL", ...Array.from(codes)];
+  }, [policyEvents]);
+
+  const topModules = useMemo(() => {
+    return [...modules]
+      .sort((a, b) => Number(b.completions || 0) - Number(a.completions || 0))
+      .slice(0, 5)
+      .map((module, index) => ({
+        ...module,
+        rank: index + 1,
+        completions: Number(module.completions || 0)
+      }));
+  }, [modules]);
+
+  const aiResponseLineData = useMemo(() => {
+    const lineColor = theme === "light" ? "#387452" : "#b0d5bc";
+    const fillColor = theme === "light" ? "rgba(56, 116, 82, 0.12)" : "rgba(176, 213, 188, 0.16)";
+    return {
+      labels: aiResponseWeekChart.labels,
+      datasets: [
+        {
+          data: aiResponseWeekChart.counts,
+          borderColor: lineColor,
+          backgroundColor: fillColor,
+          borderWidth: 2.4,
+          fill: true,
+          tension: 0.52,
+          cubicInterpolationMode: "monotone",
+          pointRadius: 0,
+          pointHoverRadius: 4.5,
+          pointBorderWidth: 0
+        }
+      ]
+    };
+  }, [aiResponseWeekChart, theme]);
+
+  const aiResponseLineOptions = useMemo(() => {
+    const axisText = theme === "light" ? "#475569" : "#8b949e";
+    const gridColor = theme === "light" ? "rgba(148, 163, 184, 0.35)" : "rgba(48, 54, 61, 0.6)";
+    const tooltipBg = theme === "light" ? "#ffffff" : "#0d1117";
+    const tooltipBorder = theme === "light" ? "#cbd5e1" : "#30363d";
+    const tooltipText = theme === "light" ? "#0f172a" : "#e6edf3";
+    return {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: tooltipBg,
+          borderColor: tooltipBorder,
+          borderWidth: 1,
+          titleColor: tooltipText,
+          bodyColor: tooltipText,
+          displayColors: false,
+          callbacks: {
+            label: (context) => `${context.raw} responses`
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: { display: false },
+          ticks: { color: axisText, font: { size: 10 } }
+        },
+        y: {
+          beginAtZero: true,
+          ticks: {
+            color: axisText,
+            precision: 0,
+            font: { size: 10 }
+          },
+          grid: { color: gridColor }
+        }
+      }
+    };
+  }, [theme]);
+
+  const topModulesBarData = useMemo(() => {
+    const barColor = theme === "light" ? "rgba(56, 116, 82, 0.75)" : "rgba(176, 213, 188, 0.85)";
+    const barBorder = theme === "light" ? "rgba(56, 116, 82, 0.95)" : "rgba(176, 213, 188, 1)";
+    return {
+      labels: topModules.map((module) => `#${module.rank}`),
+      datasets: [
+        {
+          data: topModules.map((module) => module.completions),
+          backgroundColor: barColor,
+          borderColor: barBorder,
+          borderWidth: 1,
+          borderRadius: 6,
+          maxBarThickness: 34
+        }
+      ]
+    };
+  }, [topModules, theme]);
+
+  const topModulesBarOptions = useMemo(() => {
+    const axisText = theme === "light" ? "#475569" : "#8b949e";
+    const xText = theme === "light" ? "#0369a1" : "#38bdf8";
+    const gridColor = theme === "light" ? "rgba(148, 163, 184, 0.35)" : "rgba(48, 54, 61, 0.6)";
+    const tooltipBg = theme === "light" ? "#ffffff" : "#0d1117";
+    const tooltipBorder = theme === "light" ? "#cbd5e1" : "#30363d";
+    const tooltipText = theme === "light" ? "#0f172a" : "#e6edf3";
+    return {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: tooltipBg,
+          borderColor: tooltipBorder,
+          borderWidth: 1,
+          titleColor: tooltipText,
+          bodyColor: tooltipText,
+          displayColors: false,
+          callbacks: {
+            title: (items) => {
+              const module = topModules[items[0].dataIndex];
+              return module ? `#${module.rank} ${module.title}` : "";
+            },
+            label: (context) => `${context.raw} completions`
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: { display: false },
+          ticks: { color: xText, font: { size: 10, weight: "700" } }
+        },
+        y: {
+          beginAtZero: true,
+          ticks: { color: axisText, precision: 0, font: { size: 10 } },
+          grid: { color: gridColor }
+        }
+      }
+    };
+  }, [theme, topModules]);
+
+  const recentActivity = useMemo(() => {
+    const userEvents = users.slice(0, 4).map((u) => ({
+      id: `user-${u.id}`,
+      at: u.createdAt,
+      type: "user",
+      text: `${u.firstName || ""} ${u.lastName || ""}`.trim() + " registered"
+    }));
+
+    const policyActivity = policyEvents.slice(0, 8).map((event) => ({
+      id: `policy-${event.id}`,
+      at: event.at,
+      type: event.blocked ? "blocked" : "allowed",
+      text: `Policy: ${outcomeLabel(event)}`
+    }));
+
+    return [...userEvents, ...policyActivity]
+      .sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime())
+      .slice(0, 4);
+  }, [policyEvents, users]);
+
+  const policyMessagesDirty = useMemo(() => {
+    const current = JSON.stringify(policyConfig.messages || {});
+    const draft = JSON.stringify(policyConfigDraft || {});
+    return current !== draft;
+  }, [policyConfig.messages, policyConfigDraft]);
+
+  const selectedPolicyListKey = POLICY_LIST_META[policyConfigListKey] ? policyConfigListKey : "greetingPatterns";
+  const selectedPolicyListLabel = POLICY_LIST_META[selectedPolicyListKey];
+  const selectedPolicyListHelp = POLICY_LIST_HELP[selectedPolicyListKey];
+  const selectedPolicyListEntries = policyConfig[selectedPolicyListKey] || [];
+  const selectedPolicyListQuery = String(policyConfigSearchMap[selectedPolicyListKey] || "").trim().toLowerCase();
+  const selectedPolicyListEntriesFiltered = selectedPolicyListEntries
+    .map((entry, index) => ({ entry, index }))
+    .filter((item) => String(item.entry || "").toLowerCase().includes(selectedPolicyListQuery));
+  const policyConfirmationPendingKey = policyActionConfirmation
+    ? policyActionConfirmation.action === "add"
+      ? `policy-add-${policyActionConfirmation.listKey}`
+      : `policy-del-${policyActionConfirmation.listKey}-${policyActionConfirmation.index}`
+    : "";
+
+  const showUserActionNotice = (message) => {
+    if (userActionNoticeTimerRef.current) {
+      window.clearTimeout(userActionNoticeTimerRef.current);
+    }
+    setUserActionNotice(message);
+    userActionNoticeTimerRef.current = window.setTimeout(() => {
+      setUserActionNotice("");
+      userActionNoticeTimerRef.current = null;
+    }, 3000);
+  };
+
+  const showUserActionErrorNotice = (message) => {
+    if (userActionErrorTimerRef.current) {
+      window.clearTimeout(userActionErrorTimerRef.current);
+    }
+    setUserActionErrorNotice(message);
+    userActionErrorTimerRef.current = window.setTimeout(() => {
+      setUserActionErrorNotice("");
+      userActionErrorTimerRef.current = null;
+    }, 3000);
+  };
+
+  const openCreateUserModal = () => {
+    setUserModalMode("create");
+    setEditingUserId(null);
+    setUserForm(buildDefaultUserForm());
+    setUseDefaultPassword(false);
+    setShowCreatePassword(false);
+    setShowCreateConfirmPassword(false);
+    setUserFormError("");
+    setUserModalOpen(true);
+  };
+
+  const openEditUserModal = (targetUser) => {
+    setUserModalMode("edit");
+    setEditingUserId(targetUser.id);
+    setUserForm({
+      firstName: targetUser.firstName || "",
+      lastName: targetUser.lastName || "",
+      email: targetUser.email || "",
+      password: "",
+      confirmPassword: "",
+      role: targetUser.role || "USER",
+      isActive: Boolean(targetUser.isActive)
+    });
+    setUseDefaultPassword(false);
+    setShowCreatePassword(false);
+    setShowCreateConfirmPassword(false);
+    setUserFormError("");
+    setUserModalOpen(true);
+  };
+
+  const closeUserModal = () => {
+    setUserModalOpen(false);
+    setUserFormError("");
+    setEditingUserId(null);
+    setUseDefaultPassword(false);
+    setShowCreatePassword(false);
+    setShowCreateConfirmPassword(false);
+    setUserForm(buildDefaultUserForm());
+  };
+
+  const openAccountSettings = () => {
+    setProfileMenuOpen(false);
+    setAccountPasswordForm({ currentPassword: "", newPassword: "", confirmPassword: "" });
+    setAccountPasswordVisibility({ current: false, next: false, confirm: false });
+    setAccountSettingsError("");
+    setAccountSettingsSuccess("");
+    setAccountSettingsOpen(true);
+  };
+
+  const closeAccountSettings = () => {
+    if (accountPasswordSaving) return;
+    setAccountSettingsOpen(false);
+    setAccountSettingsError("");
+    setAccountSettingsSuccess("");
+  };
+
+  const saveAccountPassword = async (event) => {
+    event.preventDefault();
+    setAccountSettingsError("");
+    setAccountSettingsSuccess("");
+
+    if (!accountPasswordForm.currentPassword || !accountPasswordForm.newPassword || !accountPasswordForm.confirmPassword) {
+      setAccountSettingsError("Complete all password fields.");
+      return;
+    }
+    if (!PASSWORD_REGEX.test(accountPasswordForm.newPassword)) {
+      setAccountSettingsError("Use at least 12 characters, at most 72 UTF-8 bytes, and avoid common passwords.");
+      return;
+    }
+    if (accountPasswordForm.newPassword !== accountPasswordForm.confirmPassword) {
+      setAccountSettingsError("New password and confirmation do not match.");
+      return;
+    }
+
+    setAccountPasswordSaving(true);
+    try {
+      const response = await api.post("/api/auth/change-password", {
+        currentPassword: accountPasswordForm.currentPassword,
+        newPassword: accountPasswordForm.newPassword
+      });
+      if (response.data?.accessToken) {
+        await refreshAccessToken();
+      }
+      setAccountPasswordForm({ currentPassword: "", newPassword: "", confirmPassword: "" });
+      setAccountSettingsSuccess(response.data?.message || "Password changed successfully.");
+    } catch (err) {
+      setAccountSettingsError(safeError(err));
+    } finally {
+      setAccountPasswordSaving(false);
+    }
+  };
+
+  const saveUserModal = async () => {
+    const resolvedPassword =
+      userModalMode === "create" && useDefaultPassword ? generatedUserPassword : userForm.password;
+    const resolvedConfirmPassword =
+      userModalMode === "create" && useDefaultPassword ? generatedUserPassword : userForm.confirmPassword;
+    const formToValidate = {
+      ...userForm,
+      password: resolvedPassword,
+      confirmPassword: resolvedConfirmPassword
+    };
+    const validationMessage = validateUserForm(userModalMode, formToValidate, {
+      allowDefaultPassword: userModalMode === "create" && useDefaultPassword
+    });
+    if (validationMessage) {
+      setUserFormError(validationMessage);
+      return;
+    }
+
+    setPendingKey("user-modal-save");
+    setUserFormError("");
+
+    const payload = {
+      firstName: userForm.firstName.trim(),
+      lastName: userForm.lastName.trim(),
+      email: userForm.email.trim().toLowerCase(),
+      role: userForm.role,
+      isActive: Boolean(userForm.isActive)
+    };
+
+    if (userModalMode === "create" && useDefaultPassword) {
+      payload.password = generatedUserPassword;
+    } else if (userForm.password.trim()) {
+      payload.password = userForm.password;
+    }
+
+    try {
+      if (userModalMode === "create") {
+        if (!payload.password) {
+          setUserFormError("Password is required for new users.");
+          return;
+        }
+        await api.post("/api/admin/users", payload);
+      } else {
+        await api.patch(`/api/admin/users/${editingUserId}`, payload);
+      }
+
+      await loadUsers();
+      closeUserModal();
+      showUserActionNotice(userModalMode === "create" ? "User account created successfully." : "User account updated successfully.");
+    } catch (err) {
+      setUserFormError(safeError(err));
+    } finally {
+      setPendingKey("");
+    }
+  };
+
+  const setUserActiveState = async (targetUser, nextActive) => {
+    const key = `user-active-${targetUser.id}`;
+    setPendingKey(key);
+
+    try {
+      await api.patch(`/api/admin/users/${targetUser.id}`, { isActive: nextActive });
+      await loadUsers();
+      showUserActionNotice(`Account ${nextActive ? "activated" : "deactivated"} successfully.`);
+    } catch (err) {
+      showUserActionErrorNotice(safeError(err));
+    } finally {
+      setPendingKey("");
+    }
+  };
+
+  const deleteUserAccount = async (targetUser) => {
+    const key = `user-delete-${targetUser.id}`;
+    setPendingKey(key);
+
+    try {
+      await api.delete(`/api/admin/users/${targetUser.id}`);
+      await loadUsers();
+      setUserPendingDeletion(null);
+      showUserActionNotice("User account deleted successfully.");
+    } catch (err) {
+      window.alert(safeError(err));
+    } finally {
+      setPendingKey("");
+    }
+  };
+
+  const refreshPolicyConfigOnly = async () => {
+    const configRes = await api.get("/api/admin/policy/config");
+    const nextConfig = configRes.data?.config || {
+      greetingPatterns: [],
+      inScopeKeywords: [],
+      outOfScopeKeywords: [],
+      safetyBlockedKeywords: [],
+      inScopeIntentPatterns: [],
+      messages: {}
+    };
+    setPolicyConfig(nextConfig);
+    setPolicyConfigDraft(nextConfig.messages || {});
+  };
+
+  const showPolicyActionSuccess = (action, listKey, value) => {
+    const actionLabels = {
+      added: "Entry added successfully",
+      edited: "Entry edited successfully",
+      deleted: "Entry deleted successfully"
+    };
+    setPolicyActionSuccess({
+      title: actionLabels[action] || "Policy configuration updated",
+      listLabel: POLICY_LIST_META[listKey] || "Policy rules",
+      value
+    });
+  };
+
+  const addPolicyEntry = (listKey) => {
+    const value = String(policyEditorListInput[listKey] || "").trim();
+    if (!value) {
+      return;
+    }
+    setPolicyEditorError("");
+    setPolicyActionConfirmation({ action: "add", listKey, value, error: "" });
+  };
+
+  const editPolicyEntry = (listKey, index, oldValue) => {
+    setPolicyEditorError("");
+    setPolicyEntryEditor({ listKey, index, value: oldValue, error: "" });
+  };
+
+  const savePolicyEntryEdit = async (event) => {
+    event.preventDefault();
+    if (!policyEntryEditor) {
+      return;
+    }
+
+    const { listKey, index } = policyEntryEditor;
+    const value = String(policyEntryEditor.value || "").trim();
+    if (!value) {
+      setPolicyEntryEditor((prev) => ({ ...prev, error: "Enter a word or phrase before saving." }));
+      return;
+    }
+
+    setPendingKey(`policy-edit-${listKey}-${index}`);
+    setPolicyEditorError("");
+    try {
+      await api.patch(`/api/admin/policy/config/${listKey}/${index}`, { value });
+      await refreshPolicyConfigOnly();
+      setPolicyEntryEditor(null);
+      showPolicyActionSuccess("edited", listKey, value);
+    } catch (err) {
+      setPolicyEntryEditor((prev) => (prev ? { ...prev, error: safeError(err) } : prev));
+    } finally {
+      setPendingKey("");
+    }
+  };
+
+  const deletePolicyEntry = (listKey, index) => {
+    const value = policyConfig[listKey]?.[index] || "Policy entry";
+    setPolicyEditorError("");
+    setPolicyActionConfirmation({ action: "delete", listKey, index, value, error: "" });
+  };
+
+  const confirmPolicyAction = async () => {
+    if (!policyActionConfirmation) {
+      return;
+    }
+
+    const { action, listKey, index, value } = policyActionConfirmation;
+    const requestKey = action === "add" ? `policy-add-${listKey}` : `policy-del-${listKey}-${index}`;
+    setPendingKey(requestKey);
+    setPolicyEditorError("");
+    try {
+      if (action === "add") {
+        await api.post(`/api/admin/policy/config/${listKey}`, { value });
+      } else {
+        await api.delete(`/api/admin/policy/config/${listKey}/${index}`);
+      }
+      await refreshPolicyConfigOnly();
+      if (action === "add") {
+        setPolicyEditorListInput((prev) => ({ ...prev, [listKey]: "" }));
+      }
+      setPolicyActionConfirmation(null);
+      showPolicyActionSuccess(action === "add" ? "added" : "deleted", listKey, value);
+    } catch (err) {
+      setPolicyActionConfirmation((prev) => (prev ? { ...prev, error: safeError(err) } : prev));
+    } finally {
+      setPendingKey("");
+    }
+  };
+
+  const savePolicyMessages = async () => {
+    setPendingKey("policy-save-messages");
+    setPolicyEditorError("");
+    try {
+      await api.put("/api/admin/policy/config", {
+        ...policyConfig,
+        messages: policyConfigDraft
+      });
+      await refreshPolicyConfigOnly();
+    } catch (err) {
+      setPolicyEditorError(safeError(err));
+    } finally {
+      setPendingKey("");
+    }
+  };
+
+  const resetPolicyConfigToDefault = async () => {
+    if (!window.confirm("Reset policy configuration to default values?")) {
+      return;
+    }
+    setPendingKey("policy-reset");
+    setPolicyEditorError("");
+    try {
+      await api.post("/api/admin/policy/config/reset");
+      await refreshPolicyConfigOnly();
+    } catch (err) {
+      setPolicyEditorError(safeError(err));
+    } finally {
+      setPendingKey("");
+    }
+  };
+
+  const updateModule = async (moduleId, patch) => {
+    const key = `module-${moduleId}`;
+    setPendingKey(key);
+    try {
+      await api.patch(`/api/admin/simulation-modules/${moduleId}`, patch);
+      await loadModules();
+    } catch (err) {
+      window.alert(safeError(err));
+    } finally {
+      setPendingKey("");
+    }
+  };
+
+  const [previewVerifiedModuleId, setPreviewVerifiedModuleId] = useState(null);
+  const [moduleEditorOpen, setModuleEditorOpen] = useState(false);
+  const openModulePreview = async (preview, options = {}) => {
+    let record=options.draftRecord || null;
+    if(record){try{const {data}=await api.get('/api/admin/simulation-drafts/'+record.id);record=data.draft;}catch(error){window.alert(safeError(error));return;}}
+    if(options.edit && options.moduleId && !record){
+      try {const {data}=await api.post('/api/admin/simulation-drafts',{moduleId:options.moduleId});record=data.draft;}
+      catch(error){window.alert(safeError(error));return;}
+    }
+    draftAutosave.initialize(record);
+    if(record){preview=record.simulation;options={...options,moduleId:record.moduleId,edit:true,draftMeta:{...options.draftMeta,draftId:record.id,title:record.title,category:record.category,sourcePrompt:record.sourcePrompt || undefined,baseRevision:record.generation?.baseRevision,initialTest:record.test}};}
+    setPreviewVerifiedModuleId(options.moduleId || null);
+    setModuleEditorOpen(Boolean(options.edit || options.draftMeta));
+    if (!preview || !Array.isArray(preview.steps) || preview.steps.length === 0) {
+      return;
+    }
+    setModulePreview(preview);
+    setModulePreviewStep(0);
+    setModulePreviewSurface(normalizeSurface(options?.surface || preview?.surface, preview?.terminalType));
+    setModuleDraftMeta(options?.draftMeta || null);
+    setModuleDraftError("");
+  };
+
+  const closeModulePreview = async (options = {}) => {
+    if(!options.skipFlush){try{await draftAutosave.flush();}catch(error){setModuleDraftError(safeError(error));return;}}
+    draftAutosave.initialize(null);
+    setModulePreview(null);
+    setModulePreviewStep(0);
+    setModulePreviewSurface("windows-terminal");
+    setModuleDraftMeta(null);
+    setModuleDraftError("");
+    await loadModules();
+  };
+
+  const createModuleFromPromptInsight = async (insight) => {
+    if (!insight?.samplePrompt) {
+      return;
+    }
+    const key = `module-draft-from-prompt-${insight.normalized || insight.samplePrompt}`;
+    setPendingKey(key);
+    try {
+      const res = await api.post("/api/admin/simulation-modules/draft", {
+        mode: "from_prompt",
+        sourcePrompt: insight.samplePrompt,
+        occurrences: Number(insight.occurrences || 1),
+        preferredSurface: insight.recommendedSurface
+      });
+      const draft = res.data?.draft;
+      if (!draft) {
+        throw new Error("Unable to generate simulation draft.");
+      }
+      openModulePreview(getModuleSimulationDefinition(draft), {
+        surface: draft.recommendedSurface || insight.recommendedSurface || draft?.simulation?.terminalType,
+        draftRecord: res.data?.draftRecord,
+        draftMeta: {
+          mode: "from_prompt",
+          sourcePrompt: insight.samplePrompt,
+          occurrences: Number(insight.occurrences || 1),
+          generationNotice: res.data?.generationNotice,
+          title: draft.title,
+          category: draft.category
+        }
+      });
+    } catch (err) {
+      window.alert(safeError(err));
+    } finally {
+      setPendingKey("");
+    }
+  };
+
+  const disregardPromptInsight = async (insight) => {
+    const prompt = String(insight?.samplePrompt || "").trim();
+    if (!prompt) {
+      return;
+    }
+    const key = `module-disregard-prompt-${insight.normalized || prompt}`;
+    setPendingKey(key);
+    try {
+      await api.post("/api/admin/simulation-modules/prompt-insights/disregard", {
+        sourcePrompt: prompt,
+        insightKey: insight.insightKey
+      });
+      setPromptInsights((prev) =>
+        prev.filter((item) => item.normalized !== insight.normalized && item.samplePrompt !== prompt)
+      );
+    } catch (err) {
+      window.alert(safeError(err));
+    } finally {
+      setPendingKey("");
+    }
+  };
+
+  const disregardAllPromptInsights = async () => {
+    if (pendingKey || promptInsightsLoading || !promptInsights.length) return;
+    const suggestions = [...promptInsights];
+    if (!window.confirm(`Disregard all ${suggestions.length} suggestions in the queue, including those hidden by search?`)) return;
+    setPendingKey("module-disregard-all");
+    setPromptInsightsError("");
+    let completed = 0;
+    try {
+      for (const insight of suggestions) {
+        await api.post("/api/admin/simulation-modules/prompt-insights/disregard", {
+          sourcePrompt: insight.samplePrompt,
+          insightKey: insight.insightKey
+        });
+        completed += 1;
+        setPromptInsights((prev) => prev.filter((item) => item !== insight));
+      }
+    } catch (err) {
+      setPromptInsightsError(`${completed} of ${suggestions.length} suggestions disregarded. Remaining suggestions are still in the queue. ${safeError(err)}`);
+    } finally {
+      setPendingKey("");
+    }
+  };
+
+  const saveModuleDraft = async () => {
+    if (!moduleDraftMeta || !modulePreview) {
+      return;
+    }
+    const steps = Array.isArray(modulePreview.steps) ? modulePreview.steps : [];
+    if (steps.length < 3) {
+      setModuleDraftError("Simulation draft must include at least 3 steps before saving.");
+      return;
+    }
+    setPendingKey("module-save-draft");
+    setModuleDraftError("");
+    try {
+      const savedDraft=await draftAutosave.flush();
+      const payload={
+        mode: "manual",
+        draftId:savedDraft?.id,draftVersion:savedDraft?.version,baseRevision:moduleDraftMeta.baseRevision,
+        title: moduleDraftMeta.title,
+        category: moduleDraftMeta.category,
+        sourcePrompt: moduleDraftMeta.sourcePrompt,
+        simulation: {
+          ...modulePreview,
+          surface: modulePreviewSurface,
+          terminalType: modulePreviewSurface === "windows-terminal" || modulePreviewSurface === "mac-terminal" ? modulePreviewSurface : null
+        },
+        enabled: false
+      };
+      if(previewVerifiedModuleId)await api.patch('/api/admin/simulation-modules/'+previewVerifiedModuleId,payload);
+      else await api.post('/api/admin/simulation-modules',payload);
+      await closeModulePreview({skipFlush:true});
+      await Promise.all([loadModules(), loadPromptInsights()]);
+    } catch (err) {
+      setModuleDraftError(safeError(err));
+    } finally {
+      setPendingKey("");
+    }
+  };
+
+  const deleteSimulationModule = async (module) => {
+    if (!module?.id) {
+      return;
+    }
+    if (!window.confirm(`Delete simulation module "${module.title}"?`)) {
+      return;
+    }
+    const key = `module-delete-${module.id}`;
+    setPendingKey(key);
+    try {
+      await api.delete(`/api/admin/simulation-modules/${module.id}`);
+      await loadModules();
+    } catch (err) {
+      window.alert(safeError(err));
+    } finally {
+      setPendingKey("");
+    }
+  };
+
+  const exportPolicyCsv = () => {
+    const rows = [
+      ["Time", "User", "Code", "Status", "Prompt", "Reason"],
+      ...filteredPolicyEvents.map((event) => [
+        formatDateTime(event.at),
+        event.userEmail || "Unknown",
+        event.code || "UNKNOWN",
+        outcomeLabel(event),
+        event.message || "",
+        event.reason || ""
+      ])
+    ];
+
+    const stamp = new Date().toISOString().slice(0, 10);
+    downloadCsv(`policy-events-${stamp}.csv`, rows);
+  };
+
+  const maxCompletions = Math.max(1, ...modules.map((m) => Number(m.completions || 0)));
+  const promptInsightFeed = useMemo(() => {
+    return Array.isArray(promptInsights) ? promptInsights : [];
+  }, [promptInsights]);
+
+  const filteredPromptInsights = useMemo(() => {
+    const query = promptInsightQuery.trim().toLowerCase();
+    if (!query) {
+      return promptInsightFeed;
+    }
+    return promptInsightFeed.filter((item) => {
+      return (
+        String(item.samplePrompt || "").toLowerCase().includes(query) ||
+        String(item.suggestedCategory || "").toLowerCase().includes(query) ||
+        String(item.recommendedSurfaceLabel || item.recommendedSurface || "").toLowerCase().includes(query)
+      );
+    });
+  }, [promptInsightFeed, promptInsightQuery]);
+
+  const filteredModules = useMemo(() => {
+    return modules.filter((module) =>
+      moduleStatusFilter === "all" || (moduleStatusFilter === "enabled" ? module.enabled : !module.enabled)
+    ).sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
+  }, [moduleStatusFilter, modules]);
+
+  const previewSteps = Array.isArray(modulePreview?.steps) ? modulePreview.steps : [];
+  const previewTotalSteps = previewSteps.length;
+  const previewSafeStep = Math.max(0, Math.min(modulePreviewStep, Math.max(0, previewTotalSteps - 1)));
+  const previewCurrentStep = previewSteps[previewSafeStep] || {};
+  const previewProgress = previewTotalSteps > 0
+    ? Math.round(((previewSafeStep + 1) / previewTotalSteps) * 100)
+    : 0;
+  const previewSurfaceOptions = [
+    { value: "windows-terminal", label: "Win", icon: ">_" },
+    { value: "mac-terminal", label: "Mac", icon: "$_" },
+    { value: "windows-os", label: "Win OS", icon: "W" },
+    { value: "mac-os", label: "Mac OS", icon: "M" }
+  ];
+  const isDraftPreview = Boolean(moduleDraftMeta);
+  const isAiGeneratedDraft = moduleDraftMeta?.mode === "from_prompt";
+  const selectedPreviewSurface = previewSurfaceOptions.find((option) => option.value === modulePreviewSurface);
+  const previewRuntimeHint = stripHtml(previewCurrentStep.action || previewCurrentStep.desc || "");
+  const previewFullName = [userForm.firstName.trim(), userForm.lastName.trim()].filter(Boolean).join(" ");
+  const previewInitials =
+    `${userForm.firstName.trim().charAt(0)}${userForm.lastName.trim().charAt(0)}`.trim().toUpperCase() || "—";
+  const showPasswordMatch =
+    userModalMode === "create" && !useDefaultPassword && userForm.confirmPassword.trim().length > 0;
+  const passwordMatch = userForm.password === userForm.confirmPassword;
+
+  const handleAdminRuntimeTerminalCommand = useCallback(
+    ({ normalizedCommand, result }) => {
+      if (!isDraftPreview) {
+        if (normalizedCommand === "help") {
+          const lines = [`Simulation context: ${previewCurrentStep.title || "Current step"}`];
+          if (previewRuntimeHint) {
+            lines.push(`Hint: ${previewRuntimeHint}`);
+          }
+          if (previewCurrentStep.result) {
+            lines.push(`Expected outcome: ${previewCurrentStep.result}`);
+          }
+          return lines;
+        }
+
+        if (result?.known) {
+          return previewCurrentStep.result ? [`Step outcome: ${previewCurrentStep.result}`] : [];
+        }
+
+        if (previewRuntimeHint) {
+          return [`Hint: ${previewRuntimeHint}`];
+        }
+      }
+
+      return [];
+    },
+    [isDraftPreview, previewCurrentStep, previewRuntimeHint]
+  );
+
+  return (
+    <div className={`admin-console-root admin-ui ${theme === "light" ? "theme-light" : ""}`}>
+      <div className="shell">
+        <aside className="sidebar">
+          <div className="sidebar-header">
+            <div className="admin-brand">
+              <div className="admin-brand-icon"><img src={helpdeskLogo} alt="HelpDesk AI" /></div>
+              <div className="admin-brand-text">
+                HelpDesk AI
+                <span>Administration</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="nav-section">Main</div>
+          {Object.entries(PAGE_META).map(([id, page]) => (
+            <button
+              key={id}
+              type="button"
+              className={`nav-item ${activePage === id ? "active" : ""}`}
+              onClick={() => setActivePage(id)}
+            >
+              <span className="nav-icon" aria-hidden="true"><NavIcon id={id} /></span>
+              {page.nav}
+            </button>
+          ))}
+
+          <div className="sidebar-footer" ref={profileMenuRef}>
+            <button
+              type="button"
+              className="profile-trigger"
+              onClick={() => setProfileMenuOpen((prev) => !prev)}
+              aria-controls="admin-account-popover"
+              aria-expanded={profileMenuOpen}
+            >
+              <div className="avatar">{(user?.firstName || "A").slice(0, 1).toUpperCase()}</div>
+              <div className="footer-copy">
+                <div className="footer-title">{user?.firstName || "System"} {user?.lastName || "Admin"}</div>
+                <div className="footer-sub">{user?.email || "Account"}</div>
+              </div>
+              <span className={`profile-caret ${profileMenuOpen ? "is-open" : ""}`} aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="m7 10 5 5 5-5" /></svg>
+              </span>
+            </button>
+
+            {profileMenuOpen ? (
+              <div id="admin-account-popover" className="profile-menu" role="region" aria-label="Administrator account">
+                <div className="profile-menu-identity"><strong>{user?.firstName || "System"} {user?.lastName || "Admin"}</strong><span>{user?.email || ""}</span></div>
+                <div className="profile-menu-row">
+                  <span>Dark mode</span>
+                  <button
+                    type="button"
+                    className={`profile-theme-switch ${theme === "dark" ? "is-on" : ""}`}
+                    onClick={() => setTheme((prev) => (prev === "dark" ? "light" : "dark"))}
+                    aria-label="Toggle dark mode"
+                    aria-pressed={theme === "dark"}
+                  >
+                    <span className="profile-theme-track">
+                      <span className="profile-theme-thumb" />
+                    </span>
+                    <span className="profile-theme-state">{theme === "dark" ? "On" : "Off"}</span>
+                  </button>
+                </div>
+                <button type="button" className="profile-account-btn" onClick={openAccountSettings}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4" /><path d="M5 21v-2a7 7 0 0 1 14 0v2" /></svg>Account settings</button>
+                <button type="button" className="logout-btn profile-logout-btn" onClick={logout}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 17v3H4V4h6v3M9 12h12m-4-4 4 4-4 4" /></svg>Log out</button>
+              </div>
+            ) : null}
+          </div>
+        </aside>
+
+        <section className="main">
+          <header className="admin-topbar">
+            <div className="admin-topbar-title">{PAGE_META[activePage].title}</div>
+            <div className="online-pill">
+              <div className="online-dot" />
+              System Online
+            </div>
+          </header>
+
+          <div className={`content ${activePage === "sims" ? "content-simulations" : ""}`}>
+            {error && activePage !== "audit" ? <div className="admin-alert error">{error}</div> : null}
+            {loading && activePage !== "audit" ? <div className="admin-alert">Loading admin data...</div> : null}
+
+            {activePage === "audit" ? <AuditLogPage /> : null}
+            {!loading && activePage === "overview" ? (
+              <div className="page active">
+                <div className="admin-tab-intro"><h1>Activity at a glance</h1><p>Review usage, recent activity, and simulation completions.</p></div>
+                <div className="metrics-grid">
+                  <div className="metric-card">
+                    <div className="metric-label">Users</div>
+                    <div className="metric-val">{userStats.total}</div>
+                    <div className="metric-sub">{userStats.active} active Â· {userStats.admins} admin</div>
+                    <div className="metric-delta delta-up">Active directory synced</div>
+                  </div>
+                  <div className="metric-card">
+                    <div className="metric-label">AI Chats Today</div>
+                    <div className="metric-val">{aiChatsToday}</div>
+                    <div className="metric-sub">Policy-checked requests</div>
+                    <div className="metric-delta delta-up">{policySummary.allowed || 0} allowed total</div>
+                  </div>
+                  <div className="metric-card">
+                    <div className="metric-label" title="Blocked requests divided by evaluated requests. Service outages are excluded.">Policy Block Rate</div>
+                    <div className="metric-val">{policySummary.blockRate || 0}%</div>
+                    <div className="metric-sub">{blockedToday} blocked today</div>
+                    <div className="metric-delta delta-dn">{policySummary.blocked || 0} blocked total</div>
+                  </div>
+                  <div className="metric-card">
+                    <div className="metric-label">Sim Completions</div>
+                    <div className="metric-val">{moduleStats.completions}</div>
+                    <div className="metric-sub">{moduleStats.total} modules configured</div>
+                    <div className="metric-delta delta-up">{moduleStats.enabled} enabled</div>
+                  </div>
+                </div>
+
+                <div className="overview-grid">
+                  <div className="panel overview-ai-panel">
+                    <div className="panel-title">AI responses (this week) <span>{aiResponseWeekChart.dateRange} · whole platform</span></div>
+                    <div className="overview-chart-shell">
+                      <Line data={aiResponseLineData} options={aiResponseLineOptions} />
+                    </div>
+                  </div>
+
+                  <div className="panel">
+                    <div className="panel-title">Top simulation modules <span>vertical ranking</span></div>
+                    <div className="overview-chart-shell topmods-chart-shell">
+                      <Bar data={topModulesBarData} options={topModulesBarOptions} />
+                    </div>
+                    <div className="topmods-legend">
+                      {topModules.map((module) => (
+                        <div key={`topmods-legend-${module.id}`} className="topmods-legend-item">
+                          <span>#{module.rank}</span>
+                          <strong>{module.title}</strong>
+                          <em>{module.completions}</em>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="overview-grid overview-grid-equal">
+                  <div className="panel">
+                    <div className="panel-title">Recent activity <span>latest events</span></div>
+                    {recentActivity.length === 0 ? (
+                      <div className="activity-item">
+                        <div className="activity-text">No activity yet.</div>
+                      </div>
+                    ) : (
+                      recentActivity.map((activity) => (
+                        <div className="activity-item" key={activity.id}>
+                          <div className={`activity-icon ${activity.type === "blocked" ? "ad" : activity.type === "user" ? "as" : "ai"}`}>
+                            {activity.type === "blocked" ? "B" : activity.type === "user" ? "U" : "A"}
+                          </div>
+                          <div>
+                            <div className="activity-text">{activity.text}</div>
+                            <div className="activity-time">{formatRelative(activity.at)}</div>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+
+                  <div className="panel">
+                    <div className="panel-title">System health</div>
+                    <div className="status-row"><div><span className="status-dot s-green" />API Server</div><div className="status-text success">Online</div></div>
+                    <div className="status-row"><div><span className="status-dot s-green" />Database</div><div className="status-text success">Connected</div></div>
+                    <div className="status-row"><div><span className="status-dot s-green" />Policy Engine</div><div className="status-text success">Active</div></div>
+                    <div className="status-row"><div><span className="status-dot s-amber" />Rate limiter</div><div className="status-text warning">Monitoring</div></div>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
+            {!loading && activePage === "users" ? (
+              <div className="page active">
+                <div className="admin-tab-intro"><h1>Manage access</h1><p>Find accounts, update roles, and manage user access.</p></div>
+                <div className="toolbar">
+                  <div className="search-box">
+                    <input name="admin-page-user-query"
+                      value={userQuery}
+                      onChange={(event) => setUserQuery(event.target.value)}
+                      aria-label="Search users by name or email" placeholder="Search users by name or email"
+                    />
+                  </div>
+                  <select name="admin-page-user-role-filter" className="filter-btn select" aria-label="Filter by role" value={userRoleFilter} onChange={(e) => setUserRoleFilter(e.target.value)}>
+                    <option value="ALL">All roles</option>
+                    <option value="USER">USER</option>
+                    <option value="ADMIN">ADMIN</option>
+                  </select>
+                  <select name="admin-page-user-status-filter" className="filter-btn select" aria-label="Filter by status" value={userStatusFilter} onChange={(e) => setUserStatusFilter(e.target.value)}>
+                    <option value="ALL">All status</option>
+                    <option value="ACTIVE">Active</option>
+                    <option value="INACTIVE">Inactive</option>
+                  </select>
+                  <button type="button" className="filter-btn create-user-btn" onClick={openCreateUserModal}>
+                    + Create User
+                  </button>
+                </div>
+
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Email</th>
+                      <th>Role</th>
+                      <th>Status</th>
+                      <th>Joined</th>
+                      <th>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredUsers.length === 0 ? (
+                      <tr>
+                        <td colSpan={6}>No users found.</td>
+                      </tr>
+                    ) : (
+                      paginatedUsers.map((targetUser) => {
+                        const busyActive = pendingKey === `user-active-${targetUser.id}`;
+                        const busyDelete = pendingKey === `user-delete-${targetUser.id}`;
+                        const isSelf = targetUser.id === user?.id;
+
+                        return (
+                          <tr key={targetUser.id}>
+                            <td>
+                              <div>{targetUser.firstName} {targetUser.lastName}</div>
+                              <div className="user-meta">{formatRelative(targetUser.createdAt)}</div>
+                            </td>
+                            <td className="muted-cell">{targetUser.email}</td>
+                            <td>
+                              <span className={`badge ${targetUser.role === "ADMIN" ? "badge-admin" : "badge-user"}`}>
+                                {targetUser.role}
+                              </span>
+                            </td>
+                            <td>
+                              <span className={`badge ${targetUser.isActive ? "badge-active" : "badge-inactive"}`}>
+                                {targetUser.isActive ? "ACTIVE" : "INACTIVE"}
+                              </span>
+                            </td>
+                            <td className="muted-cell">{formatDateTime(targetUser.createdAt)}</td>
+                            <td>
+                              <div className="action-row">
+                                <button
+                                  type="button"
+                                  className="btn-sm"
+                                  onClick={() => openEditUserModal(targetUser)}
+                                >
+                                  Edit
+                                </button>
+                                <button
+                                  type="button"
+                                  className={`btn-sm ${targetUser.isActive ? "btn-danger" : ""}`}
+                                  disabled={busyActive || isSelf}
+                                  onClick={() => setUserActiveState(targetUser, !targetUser.isActive)}
+                                >
+                                  {targetUser.isActive ? "Deactivate" : "Activate"}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn-sm btn-danger"
+                                  disabled={busyDelete || isSelf}
+                                  onClick={() => setUserPendingDeletion(targetUser)}
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+
+                <PaginationControls
+                  page={userPage}
+                  pageCount={userPageCount}
+                  total={filteredUsers.length}
+                  itemLabel="users"
+                  onPageChange={setUserPage}
+                />
+              </div>
+            ) : null}
+
+            {!loading && activePage === "policy" ? (
+              <div className="page active">
+                <div className="admin-tab-intro"><h1>Review policy decisions</h1><p>Inspect allowed and blocked requests, or adjust the policy configuration.</p></div>
+                <div className="policy-kpi-grid">
+                  <div className="policy-kpi-card">
+                    <span>Total Decisions</span>
+                    <strong>{policySummary.total || 0}</strong>
+                  </div>
+                  <div className="policy-kpi-card">
+                    <span>Allowed</span>
+                    <strong>{policySummary.allowed || 0}</strong>
+                  </div>
+                  <div className="policy-kpi-card">
+                    <span>Blocked</span>
+                    <strong>{policySummary.blocked || 0}</strong>
+                  </div>
+                  <div className="policy-kpi-card">
+                    <span>Block Rate</span>
+                    <strong>{policySummary.blockRate || 0}%</strong>
+                  </div>
+                </div>
+
+                <div className="policy-outcome-summary">{[["Redirected", policySummary.redirected], ["Output filtered", policySummary.outputFiltered], ["Unavailable", policySummary.unavailable]].map(([label, count]) => <div key={label}><span>{label}</span><strong>{count ?? 0}</strong></div>)}<p>Block rate = blocked / evaluated requests. Service failures are excluded. Today uses Philippine time. Events refresh every 30 seconds.</p></div>
+
+                <div className="policy-workspace-tabs" role="tablist" aria-label="Policy workspace">
+                  <button
+                    type="button"
+                    className={`policy-workspace-tab ${policyWorkspaceTab === "decisions" ? "active" : ""}`}
+                    role="tab"
+                    aria-selected={policyWorkspaceTab === "decisions"}
+                    onClick={() => setPolicyWorkspaceTab("decisions")}
+                  >
+                    Decisions
+                  </button>
+                  <button
+                    type="button"
+                    className={`policy-workspace-tab ${policyWorkspaceTab === "configuration" ? "active" : ""}`}
+                    role="tab"
+                    aria-selected={policyWorkspaceTab === "configuration"}
+                    onClick={() => setPolicyWorkspaceTab("configuration")}
+                  >
+                    Configuration
+                  </button>
+                </div>
+
+                {policyWorkspaceTab === "decisions" ? (
+                  <div className="policy-workspace policy-workspace-stacked">
+                    <div className="policy-decisions">
+                      <div className="policy-workspace-head">
+                        <div className="policy-workspace-title">Policy Decisions</div>
+                        <div className="policy-results-count">{filteredPolicyEvents.length} events</div>
+                      </div>
+                      <div className="policy-filter-grid">
+                        <input name="admin-page-policy-query"
+                          className="policy-search-input"
+                          placeholder="Search prompt, reason, user, or code"
+                          value={policyQuery}
+                          onChange={(event) => setPolicyQuery(event.target.value)}
+                        />
+                        <select name="admin-page-policy-code-filter" className="filter-btn select" value={policyCodeFilter} onChange={(event) => setPolicyCodeFilter(event.target.value)}>
+                          {policyCodeOptions.map((code) => (
+                            <option key={code} value={code}>{code === "ALL" ? "All codes" : code}</option>
+                          ))}
+                        </select>
+                        <select name="admin-page-policy-status-filter" className="filter-btn select" value={policyStatusFilter} onChange={(event) => setPolicyStatusFilter(event.target.value)}>
+                          <option value="ALL">All status</option>
+                          <option value="ALLOWED">Allowed</option>
+                          <option value="BLOCKED">Blocked</option>
+                          <option value="REDIRECTED">Redirected</option>
+                          <option value="OUTPUT_FILTERED">Output filtered</option>
+                          <option value="UNAVAILABLE">Unavailable</option>
+                        </select>
+                        <select name="admin-page-policy-time-filter" className="filter-btn select" value={policyTimeFilter} onChange={(event) => setPolicyTimeFilter(event.target.value)}>
+                          <option value="ALL">All time</option>
+                          <option value="TODAY">Today</option>
+                          <option value="WEEK">This week</option>
+                        </select>
+                        <button type="button" className="filter-btn export" onClick={exportPolicyCsv}>Export CSV</button>
+                      </div>
+
+                      <div className="event-row event-header">
+                        <div className="event-col event-col-time">Time</div>
+                        <div className="event-col event-col-user">User</div>
+                        <div className="event-col event-col-code">Code</div>
+                        <div className="event-col event-col-status">Status</div>
+                        <div className="event-col event-col-actions">Actions</div>
+                      </div>
+                      <div className="event-body">
+                        {filteredPolicyEvents.length === 0 ? (
+                          <div className="event-row">
+                            <div className="prompt-cell" style={{ gridColumn: "1 / -1" }}>No policy events found for the selected filters.</div>
+                          </div>
+                        ) : (
+                          paginatedPolicyEvents.map((event) => (
+                            <div className="event-row" key={event.id}>
+                              <div className="muted-cell event-cell event-col-time">{formatDateTime(event.at)}</div>
+                              <div className="muted-cell event-cell event-col-user">{event.userEmail || "Unknown"}</div>
+                              <div className="muted-cell event-cell event-col-code">{event.code || "UNKNOWN"}</div>
+                              <div className="event-cell event-col-status event-status-cell">
+                                <span className={`badge ${outcomeBadge(event)}`}>
+                                  {outcomeLabel(event)}
+                                </span>
+                              </div>
+                              <div className="event-cell event-col-actions">
+                                <button
+                                  type="button"
+                                  className="policy-event-view-btn"
+                                  onClick={() => setSelectedPolicyEvent(event)}
+                                  aria-label={`View policy event details for ${event.userEmail || "user"}`}
+                                  title="View event details"
+                                >
+                                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12s3.6-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.6 6.5-9.5 6.5S2.5 12 2.5 12Z" /><circle cx="12" cy="12" r="2.7" /></svg>
+                                  <span>View</span>
+                                </button>
+                              </div>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                      <PaginationControls
+                        page={policyPage}
+                        pageCount={policyPageCount}
+                        total={filteredPolicyEvents.length}
+                        itemLabel="events"
+                        onPageChange={setPolicyPage}
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <div className="policy-workspace policy-workspace-stacked">
+                    <div className="policy-editor policy-editor-full">
+                      <div className="policy-editor-head">
+                        <h3>Policy Configuration (Runtime)</h3>
+                        <span className="policy-editor-hint">Changes apply to new prompts immediately</span>
+                      </div>
+
+                      {policyEditorError ? <div className="admin-alert error">{policyEditorError}</div> : null}
+
+                      <div className="policy-config-tabs" role="tablist" aria-label="Policy configuration">
+                        <button
+                          type="button"
+                          className={`policy-config-tab ${policyConfigTab === "rules" ? "active" : ""}`}
+                          role="tab"
+                          aria-selected={policyConfigTab === "rules"}
+                          onClick={() => setPolicyConfigTab("rules")}
+                        >
+                          Rules
+                        </button>
+                        <button
+                          type="button"
+                          className={`policy-config-tab ${policyConfigTab === "messages" ? "active" : ""}`}
+                          role="tab"
+                          aria-selected={policyConfigTab === "messages"}
+                          onClick={() => setPolicyConfigTab("messages")}
+                        >
+                          Messages
+                        </button>
+                      </div>
+
+                      {policyConfigTab === "rules" ? <div className="policy-rule-workspace">
+                        <nav className="policy-rule-nav" aria-label="Policy rule sets">
+                          <span className="policy-rule-nav-label">Rule sets</span>
+                          {Object.entries(POLICY_LIST_META).map(([listKey, label]) => {
+                            const isActive = selectedPolicyListKey === listKey;
+                            return <button
+                              key={listKey}
+                              type="button"
+                              className={`policy-rule-nav-item ${isActive ? "active" : ""}`}
+                              onClick={() => setPolicyConfigListKey(listKey)}
+                            >
+                              <span>{label}</span>
+                              <small>{(policyConfig[listKey] || []).length}</small>
+                            </button>;
+                          })}
+                        </nav>
+
+                        <section className="policy-rule-editor">
+                          <div className="policy-rule-editor-head">
+                            <div>
+                              <h4>{selectedPolicyListLabel}</h4>
+                              <p>{selectedPolicyListHelp}</p>
+                            </div>
+                          </div>
+                          {selectedPolicyListKey === "safetyBlockedKeywords" && safetyRules ? (
+                            <div className="policy-safety-baseline">
+                              <p>These keywords are managed here. Deleting a keyword removes its keyword block. Threat detection and provider moderation run separately and may still reject unsafe content.</p>
+                            </div>
+                          ) : null}
+                          <div className="policy-list-add">
+                            <input name="admin-page-policy-editor-list-input"
+                              value={policyEditorListInput[selectedPolicyListKey] || ""}
+                              onChange={(event) =>
+                                setPolicyEditorListInput((prev) => ({ ...prev, [selectedPolicyListKey]: event.target.value }))
+                              }
+                              placeholder={POLICY_LIST_PLACEHOLDERS[selectedPolicyListKey]}
+                            />
+                            <button
+                              type="button"
+                              className="btn-sm create-user-btn"
+                              disabled={pendingKey === `policy-add-${selectedPolicyListKey}`}
+                              onClick={() => addPolicyEntry(selectedPolicyListKey)}
+                            >
+                              Add entry
+                            </button>
+                          </div>
+                          <input name="admin-page-policy-config-search-map"
+                            className="policy-list-search"
+                            value={policyConfigSearchMap[selectedPolicyListKey] || ""}
+                            onChange={(event) =>
+                              setPolicyConfigSearchMap((prev) => ({ ...prev, [selectedPolicyListKey]: event.target.value }))
+                            }
+                            placeholder={`Search ${selectedPolicyListLabel.toLowerCase()}`}
+                          />
+                          <div className="policy-list-items policy-rule-items">
+                            {selectedPolicyListEntriesFiltered.map(({ entry, index }) => (
+                              <div className="policy-item-row" key={`${selectedPolicyListKey}-${index}-${entry}`}>
+                                <div className="policy-item-text">{entry}</div>
+                                <div className="policy-item-actions">
+                                  <button type="button" className="btn-sm" onClick={() => editPolicyEntry(selectedPolicyListKey, index, entry)}>
+                                    Edit
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn-sm btn-danger"
+                                    onClick={() => deletePolicyEntry(selectedPolicyListKey, index)}
+                                  >
+                                    Delete
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                            {selectedPolicyListEntries.length === 0 ? <div className="muted-cell">No entries.</div> : null}
+                            {selectedPolicyListEntries.length > 0 && selectedPolicyListEntriesFiltered.length === 0 ? (
+                              <div className="muted-cell">No matching entries.</div>
+                            ) : null}
+                          </div>
+                        </section>
+                      </div> : null}
+
+                      {policyConfigTab === "messages" ? (
+                        <section className="policy-messages-pane">
+                          <div className="policy-messages-head">
+                            <div>
+                              <h4>Policy Messages</h4>
+                              <p>Responses used for greetings, HelpDesk scope redirects, and invalid requests.</p>
+                            </div>
+                            <span className="policy-list-count">{Object.keys(policyConfigDraft || {}).length}</span>
+                          </div>
+                          <div className="policy-message-grid">
+                            {Object.entries(policyConfigDraft || {}).map(([key, value]) => (
+                              <label key={key} className="policy-message-field">
+                                <span>{key}</span>
+                                <textarea name={`policy-message-${key}`}
+                                  rows={2}
+                                  value={value || ""}
+                                  onChange={(event) =>
+                                    setPolicyConfigDraft((prev) => ({ ...prev, [key]: event.target.value }))
+                                  }
+                                />
+                              </label>
+                            ))}
+                          </div>
+                          <button
+                            type="button"
+                            className="btn-sm sim-runtime-start-btn"
+                            disabled={pendingKey === "policy-save-messages" || !policyMessagesDirty}
+                            onClick={savePolicyMessages}
+                          >
+                            {pendingKey === "policy-save-messages" ? "Saving..." : "Save Messages"}
+                          </button>
+                        </section>
+                      ) : null}
+
+                      <div className="policy-danger-zone">
+                        <div>
+                          <strong>Reset configuration</strong>
+                          <span>Restore all policy rules and messages to the system defaults.</span>
+                        </div>
+                        <button
+                          type="button"
+                          className="btn-sm btn-danger"
+                          disabled={pendingKey === "policy-reset"}
+                          onClick={resetPolicyConfigToDefault}
+                        >
+                          {pendingKey === "policy-reset" ? "Resetting..." : "Reset Default"}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : null}
+
+            {!loading && activePage === "sims" ? (
+              <div className="page active simulation-modules-page">
+                <div className="policy-kpi-grid">
+                  <div className="policy-kpi-card"><span>Active Modules</span><strong>{moduleStats.enabled}</strong></div>
+                  <div className="policy-kpi-card"><span>Suggestions to Review</span><strong>{promptInsightFeed.length}</strong></div>
+                  <div className="policy-kpi-card"><span>Prompt Variants Grouped</span><strong>{promptInsightFeed.reduce((sum, item) => sum + Number(item.similarPromptVariants || 1), 0)}</strong></div>
+                  <div className="policy-kpi-card"><span>Module Completions</span><strong>{moduleStats.completions}</strong></div>
+                </div>
+                {savedDrafts.length ? <section className="saved-simulation-drafts"><h2>Saved drafts</h2><p>Unpublished work saved automatically. Resume a draft to continue editing and testing.</p>{savedDrafts.map(record=><div className="saved-draft-row" key={record.id}><div><strong>{record.title}</strong><span>{record.simulation?.surface} / Updated {new Date(record.updatedAt).toLocaleString()}</span></div><button type="button" className="btn-sm" onClick={()=>openModulePreview(record.simulation,{draftRecord:record})}>Resume draft</button><button type="button" className="btn-sm btn-danger" onClick={async()=>{try{await api.delete('/api/admin/simulation-drafts/'+record.id);await loadModules();}catch(error){window.alert(safeError(error));}}}>Discard</button></div>)}</section>:null}
+                <div className="sim-view-tabs" role="tablist" aria-label="Simulation module views">
+                  <button type="button" className={simulationView === "modules" ? "active" : ""} onClick={() => setSimulationView("modules")} role="tab" aria-selected={simulationView === "modules"}>Modules <span>{moduleStats.total}</span></button>
+                  <button type="button" className={simulationView === "suggestions" ? "active" : ""} onClick={() => setSimulationView("suggestions")} role="tab" aria-selected={simulationView === "suggestions"}>Suggestion Queue <span>{promptInsightFeed.length}</span></button>
+                </div>
+                <div className="panel sim-workspace">
+                  {simulationView === "suggestions" ? (
+                    <>
+                      <div className="sim-workspace-head sim-prompt-head">
+                        <div><div className="panel-title">Prompt Monitoring</div><p className="sim-sample-note">Suggestions reflect the latest 200 policy events, not lifetime totals.</p></div>
+                        <div className="sim-prompt-toolbar">
+                          <input name="admin-page-prompt-insight-query" className="policy-search-input" value={promptInsightQuery} onChange={(event) => setPromptInsightQuery(event.target.value)} placeholder="Search prompt patterns" aria-label="Search prompt patterns" />
+                          <div className="sim-prompt-toolbar-actions">
+                          <button type="button" className="btn-sm" disabled={promptInsightsLoading || Boolean(pendingKey)} onClick={loadPromptInsights}>{promptInsightsLoading ? "Refreshing..." : "Refresh"}</button>
+                          <button type="button" className="btn-sm btn-danger" disabled={promptInsightsLoading || Boolean(pendingKey) || !promptInsightFeed.length} onClick={disregardAllPromptInsights}>{pendingKey === "module-disregard-all" ? "Disregarding all..." : "Disregard all"}</button>
+                          </div>
+                        </div>
+                      </div>
+                      {promptInsightsError ? <div className="admin-alert error">{promptInsightsError}</div> : null}
+                      <div className="sim-suggestion-list">
+                      {filteredPromptInsights.length === 0 ? (
+                        <SimulationEmptyState
+                          type="queue"
+                          title="No prompt patterns to review"
+                          message="Eligible user requests will appear here once the system detects a simulation-ready pattern."
+                        />
+                      ) : (
+                        filteredPromptInsights.map((insight) => {
+                          const createKey = `module-draft-from-prompt-${insight.normalized || insight.samplePrompt}`;
+                          const disregardKey = `module-disregard-prompt-${insight.normalized || insight.samplePrompt}`;
+                          const creating = pendingKey === createKey;
+                          const disregarding = pendingKey === disregardKey;
+                          const isSample = Boolean(insight.isSample);
+                          return (
+                            <details className="sim-suggestion-row" key={insight.normalized || insight.samplePrompt}>
+                              <summary>
+                                <div className="sim-suggestion-main"><strong>{insight.samplePrompt}</strong><span>{insight.suggestedCategory} · {insight.recommendedSurfaceLabel || formatSurfaceLabel(insight.recommendedSurface)}</span></div>
+                                <div className="sim-suggestion-count"><strong>{insight.occurrences}</strong><span>recent occurrences</span></div>
+                                <svg className="sim-row-chevron" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+                              </summary>
+                              <div className="sim-suggestion-details">
+                                <div className="sim-prompt-text">{insight.samplePrompt}</div>
+                              <div className="sim-prompt-meta">
+                                <span>{insight.occurrences} recent occurrences</span>
+                                {insight.similarPromptVariants > 1 ? <span>{insight.similarPromptVariants} similar prompts</span> : null}
+                                <span>{insight.uniqueUsers} users</span>
+                                <span>{insight.suggestedCategory}</span>
+                                <span>{insight.recommendedSurfaceLabel || formatSurfaceLabel(insight.recommendedSurface)}</span>
+                                <span>Last {formatRelative(insight.lastSeen)}</span>
+                              </div>
+                              <div className="sim-prompt-actions">
+                                <button
+                                  type="button"
+                                  className="btn-sm create-user-btn"
+                                  disabled={promptInsightsLoading || Boolean(pendingKey)}
+                                  onClick={() => createModuleFromPromptInsight(insight)}
+                                >
+                                  {creating ? "Generating..." : "Generate AI Draft"}
+                                </button>
+                                {!isSample ? (
+                                  <button
+                                    type="button"
+                                    className="btn-sm btn-danger"
+                                    disabled={promptInsightsLoading || Boolean(pendingKey)}
+                                    onClick={() => disregardPromptInsight(insight)}
+                                  >
+                                    {disregarding ? "Disregarding..." : "Disregard"}
+                                  </button>
+                                ) : null}
+                              </div>
+                              </div>
+                            </details>
+                          );
+                        })
+                      )}
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                    <div className="sim-workspace-head sim-modules-head">
+                      <div className="panel-title">
+                        Modules
+                      </div>
+                      <div className="sim-module-filters">
+                        <select name="admin-page-module-status-filter" value={moduleStatusFilter} onChange={(event) => setModuleStatusFilter(event.target.value)} aria-label="Filter modules by status"><option value="all">All statuses</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select>
+                      </div>
+                    </div>
+                    <div className="sim-grid">
+                      {filteredModules.length === 0 ? (
+                        <SimulationEmptyState
+                          type="modules"
+                          title={moduleStats.total === 0 ? "No simulation modules yet" : "No matching modules"}
+                          message={moduleStats.total === 0 ? "Create a module from the Suggestion Queue to start the library." : "Try changing the status filter to see available modules."}
+                        />
+                      ) : filteredModules.map((module) => {
+                        const completions = Number(module.completions || 0);
+                        const progressWidth = Math.round((completions / maxCompletions) * 100);
+                        const pending = pendingKey === `module-${module.id}`;
+                        const deleting = pendingKey === `module-delete-${module.id}`;
+                        const moduleSimulation = getModuleSimulationDefinition(module);
+                        const canTestWindows = moduleSimulation.surface === "windows-os";
+
+                        return (
+                          <div className="sim-card" key={module.id}>
+                            <div className="sim-card-header">
+                              <div>
+                                <div className="sim-title">{module.title}</div>
+                                <div className="sim-cat">{module.category}</div>
+                                {module.validationErrors?.length ? <p className="admin-alert error">Needs repair: {module.validationErrors[0]}</p> : null}
+                              </div>
+                              <div className="sim-controls">
+                                <span className={`badge ${module.enabled ? "badge-active" : "badge-inactive"}`}>
+                                  {module.enabled ? "Enabled" : "Disabled"}
+                                </span>
+                              </div>
+                            </div>
+
+                            <div className="progress-bar"><div className="progress-fill" style={{ width: `${progressWidth}%` }} /></div>
+
+                            <div className="sim-stats">
+                              <div className="sim-stat"><strong>{completions}</strong> completions</div>
+                              {module.attemptMetrics ? <div className="sim-stat">Verified runtime: {module.attemptMetrics.started} started ? {module.attemptMetrics.completed} completed ? {module.attemptMetrics.active} active ? {module.attemptMetrics.ended} ended ? {module.attemptMetrics.expired} expired ? {module.attemptMetrics.mistakes} mistakes</div> : null}
+                              <div className="sim-stat"><strong>{Number(module.avgSteps || 0).toFixed(1)}</strong> avg steps</div>
+                            </div>
+
+                            <ModuleRevisionHistory moduleId={module.id} />
+                            <div className="sim-actions">
+                              <button
+                                type="button"
+                                className="btn-sm"
+                                onClick={() =>
+                                  openModulePreview(moduleSimulation, {
+                                    surface: module?.simulation?.surface,
+                                    moduleId: module.id,
+                                  })
+                                }
+                              >
+                                View Simulation
+                              </button>
+                              {["windows-terminal", "mac-terminal", "windows-os", "mac-os"].includes(moduleSimulation.surface) ? (
+                                <button type="button" className="btn-sm" onClick={() => openModulePreview(moduleSimulation, {surface:moduleSimulation.surface,moduleId:module.id,edit:true})}>Edit Simulation</button>
+                              ) : null}
+                              {canTestWindows ? (
+                                <button
+                                  type="button"
+                                  className="btn-sm sim-runtime-start-btn"
+                                  onClick={() => setAdminWindowsOsTest({ id: module.id, title: module.title, steps: moduleSimulation.steps })}
+                                >
+                                  Test Windows
+                                </button>
+                              ) : null}
+                              <button
+                                type="button"
+                                className={`btn-sm ${module.enabled ? "btn-danger" : ""}`}
+                                disabled={pending}
+                                onClick={() => !module.enabled && ["windows-terminal", "mac-terminal"].includes(moduleSimulation.surface) ? openModulePreview(moduleSimulation, {surface:moduleSimulation.surface,moduleId:module.id,edit:true}) : updateModule(module.id, { enabled: !module.enabled })}
+                              >
+                                {module.enabled ? "Disable" : "Enable"}
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-sm btn-danger"
+                                disabled={deleting}
+                                onClick={() => deleteSimulationModule(module)}
+                              >
+                                {deleting ? "Deleting..." : "Delete"}
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </section>
+      </div>
+
+      {modulePreview ? (
+        <div className="admin-modal-overlay" onClick={closeModulePreview}>
+          <div className="admin-modal sim-preview-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="sim-preview-topbar">
+              <div className="sim-preview-topbar-left">
+                <div className="sim-preview-window-dots" aria-hidden="true">
+                  <span className="dot red" />
+                  <span className="dot yellow" />
+                  <span className="dot green" />
+                </div>
+                <div className="sim-preview-module-title">
+                  <span>{modulePreview.title}</span> · {isDraftPreview ? "AI Module" : "Simulation"}
+                </div>
+              </div>
+              <div className="sim-preview-topbar-right">
+                <ModalCloseButton type="button" className="btn-sm sim-preview-close-btn" onClick={closeModulePreview} aria-label="Close simulation preview" />
+              </div>
+            </div>
+
+            {moduleDraftMeta?.generationNotice && !moduleDraftMeta.generationNotice.startsWith('AI-generated draft:') ? <p className="admin-generation-notice" role="status">{moduleDraftMeta.generationNotice}</p> : null}
+            {moduleDraftError ? <div className="admin-alert error">{moduleDraftError}</div> : null}
+
+            {moduleEditorOpen && ["windows-terminal", "mac-terminal"].includes(modulePreviewSurface) ? (
+              <TerminalModuleTester key={previewVerifiedModuleId || moduleDraftMeta?.sourcePrompt || modulePreview.title} definition={{...modulePreview,surface:modulePreviewSurface,terminalType:modulePreviewSurface}} existing={Boolean(previewVerifiedModuleId)} initialTest={moduleDraftMeta?.initialTest} onChange={draftAutosave.change} saveStatus={draftAutosave.status} onSave={async (simulation,testToken) => {
+                const savedDraft=await draftAutosave.flush();
+                const draftInfo={draftId:savedDraft?.id,draftVersion:savedDraft?.version,baseRevision:moduleDraftMeta?.baseRevision};
+                if(previewVerifiedModuleId) await api.patch(`/api/admin/simulation-modules/${previewVerifiedModuleId}`, {simulation,testToken,enabled:true,...draftInfo});
+                else await api.post("/api/admin/simulation-modules", {mode:"manual",title:moduleDraftMeta?.title || simulation.title,category:moduleDraftMeta?.category || "General",sourcePrompt:moduleDraftMeta?.sourcePrompt,simulation,testToken,enabled:false,...draftInfo});
+                await closeModulePreview({skipFlush:true}); await loadModules();
+              }} />
+            ) : isDraftPreview ? (
+              <>
+                <DesktopModuleEditor definition={modulePreview} busy={pendingKey === 'module-save-draft'} onChange={next => {setModulePreview(next);draftAutosave.change(next);setModuleDraftError('');}} />
+
+                <div className="sim-preview-footer">
+                  <div className="sim-preview-footer-center">
+                    <div className="sim-preview-step-dots" aria-hidden="true">
+                      {previewSteps.map((step, index) => (
+                        <span
+                          key={`dot-${step.title}-${index}`}
+                          className={`sim-preview-step-dot ${index < previewSafeStep ? "done" : index === previewSafeStep ? "active" : "todo"}`}
+                        />
+                      ))}
+                    </div>
+                    <span className="sim-preview-footer-nav">{draftAutosave.status}</span>
+                  </div>
+                  <div className="sim-preview-btn-row">
+                    <button type="button" className="btn-sm sim-preview-discard" onClick={async()=>{try{await draftAutosave.flush();await api.delete('/api/admin/simulation-drafts/'+moduleDraftMeta.draftId);await closeModulePreview({skipFlush:true});await loadModules();}catch(error){setModuleDraftError(safeError(error));}}}>
+                      Discard Draft
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-sm sim-preview-approve"
+                      disabled={pendingKey === "module-save-draft"}
+                      onClick={saveModuleDraft}
+                    >
+                      {pendingKey === "module-save-draft" ? "Saving..." : "Approve & Save Module"}
+                    </button>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="sim-runtime-body">
+                  <aside className="sim-runtime-steps">
+                    <h3>Simulation Steps</h3>
+                    <div className="sim-runtime-step-list">
+                      {previewSteps.map((step, index) => (
+                        <button
+                          key={`runtime-step-${step.title}-${index}`}
+                          type="button"
+                          className={`sim-runtime-step ${index === previewSafeStep ? "active" : ""}`}
+                          onClick={() => setModulePreviewStep(index)}
+                        >
+                          <span className="sim-runtime-step-num">{index + 1}</span>
+                          <span className="sim-runtime-step-copy">
+                            <span className="sim-runtime-step-title">{step.title}</span>
+                            {step.action ? <span className="sim-runtime-step-sub">{step.action}</span> : null}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </aside>
+
+                  <section className="sim-runtime-canvas">
+                    <h3>Simulation Canvas</h3>
+                    <div className="sim-runtime-status-row">
+                      <span className="sim-runtime-status-pill">Scenario: {(modulePreview.scenarioType || "general").toUpperCase()}</span>
+                    </div>
+
+                    <div className="sim-runtime-current">
+                      <div className="sim-runtime-current-label">Current Step</div>
+                      <div className="sim-runtime-current-head">
+                        <span className="sim-runtime-current-num">{previewTotalSteps === 0 ? 0 : previewSafeStep + 1}</span>
+                        <span className="sim-runtime-current-title">{previewCurrentStep.title || "No step available"}</span>
+                      </div>
+                      <div className="sim-runtime-current-text">{previewCurrentStep.action || "No action provided."}</div>
+                      {previewCurrentStep.desc ? (
+                        <div className="sim-runtime-current-text sim-runtime-current-subtext" >{plainDescription(previewCurrentStep.desc)}</div>
+                      ) : null}
+                    </div>
+
+                    {modulePreviewSurface === "windows-os" ? (
+                      <div className="sim-runtime-windows-os-preview">
+                        <img src={windowsOsPreviewImg} alt="Windows Server 2025 simulation preview" />
+                        <div className="sim-runtime-windows-os-shade" />
+                        <div className="sim-runtime-windows-os-card">
+                          <span className="sim-runtime-windows-os-badge">Windows OS environment preview</span>
+                          <h4>Guided workspace surface</h4>
+                          <p>This preview shows the environment learners will use for the steps above.</p>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="sim-runtime-terminal">
+                        <div className="sim-preview-terminal-head">
+                          <span className="dot red" />
+                          <span className="dot yellow" />
+                          <span className="dot green" />
+                          <strong>{modulePreviewSurface === "mac-terminal" ? "Mac Terminal" : "Windows Terminal"}</strong>
+                        </div>
+                        <TerminalEmulator
+                          className="sim-runtime-terminal-body"
+                          initialMessage={`${modulePreviewSurface === "mac-terminal" ? "Mac" : "Windows"} Terminal simulation ready. Type 'help' for available commands.`}
+                          username="student"
+                          hostname="DESKTOP-SIM"
+                          initialPath="C:\\Users\\student"
+                          onCommand={handleAdminRuntimeTerminalCommand}
+                        />
+                      </div>
+                    )}
+                  </section>
+                </div>
+
+                <div className="sim-runtime-footer">
+                  <div className="sim-preview-footer-center">
+                    <div className="sim-preview-step-dots" aria-hidden="true">
+                      {previewSteps.map((step, index) => (
+                        <span
+                          key={`dot-${step.title}-${index}`}
+                          className={`sim-preview-step-dot ${index < previewSafeStep ? "done" : index === previewSafeStep ? "active" : "todo"}`}
+                        />
+                      ))}
+                    </div>
+                    <span className="sim-preview-footer-nav">Step {previewTotalSteps === 0 ? 0 : previewSafeStep + 1} of {previewTotalSteps}</span>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      ) : null}
+
+      {selectedPolicyEvent ? (
+        <div className="admin-modal-overlay policy-event-modal-overlay" onClick={() => setSelectedPolicyEvent(null)}>
+          <section className="policy-event-modal" role="dialog" aria-modal="true" aria-labelledby="policy-event-modal-title" onClick={(event) => event.stopPropagation()}>
+            <header className="policy-event-modal-head">
+              <div>
+                <span className="policy-event-modal-kicker">Policy decision details</span>
+                <h3 id="policy-event-modal-title">{`${outcomeLabel(selectedPolicyEvent)} request`}</h3>
+              </div>
+              <ModalCloseButton type="button" className="account-modal-close" onClick={() => setSelectedPolicyEvent(null)} aria-label="Close policy event details" />
+            </header>
+
+            <div className="policy-event-modal-meta">
+              <span className={`badge ${outcomeBadge(selectedPolicyEvent)}`}>{outcomeLabel(selectedPolicyEvent)}</span>
+              <span>{selectedPolicyEvent.code || "UNKNOWN"}</span>
+              <span>{formatDateTime(selectedPolicyEvent.at)}</span>
+            </div>
+
+            <div className="policy-event-modal-section">
+              <span>User</span>
+              <strong>{selectedPolicyEvent.userEmail || "Unknown user"}</strong>
+            </div>
+            <div className="policy-event-modal-section">
+              <span>Prompt</span>
+              <p>{selectedPolicyEvent.message || "No prompt recorded."}</p>
+            </div>
+            <div className="policy-event-modal-section">
+              <span>Policy reason</span>
+              <p>{selectedPolicyEvent.reason || "No reason recorded."}</p>
+            </div>
+            {selectedPolicyEvent.hasHistory ? <div className="policy-event-history-note">This decision was evaluated with relevant conversation history.</div> : null}
+            {selectedPolicyEvent.sessionId ? <div className="policy-event-modal-section"><span>Conversation</span><p>{selectedPolicyEvent.sessionId}</p><span>Request</span><p>{selectedPolicyEvent.requestId || "Historical event"}</p></div> : null}
+            {selectedPolicyEvent.userId && selectedPolicyEvent.sessionId ? <div className="policy-event-modal-section">
+              <button type="button" className="btn-sm" disabled={pendingKey === "reset-session-cooldown" || selectedPolicyEvent.cooldownReset} onClick={async () => {
+                setPendingKey("reset-session-cooldown");
+                try {
+                  await api.post(`/api/admin/session-restrictions/${selectedPolicyEvent.userId}/reset`, { sessionId: selectedPolicyEvent.sessionId });
+                  setSelectedPolicyEvent(previous => previous ? { ...previous, cooldownReset: true } : previous);
+                } catch (error) { setError(safeError(error)); }
+                finally { setPendingKey(""); }
+              }}>{selectedPolicyEvent.cooldownReset ? "Cooldown reset" : pendingKey === "reset-session-cooldown" ? "Resetting..." : "Reset session cooldown"}</button>
+            </div> : null}
+          </section>
+        </div>
+      ) : null}
+
+      {policyActionConfirmation ? (
+        <div
+          className="admin-modal-overlay policy-confirm-overlay"
+          onClick={() => pendingKey !== policyConfirmationPendingKey && setPolicyActionConfirmation(null)}
+        >
+          <section
+            className={`policy-confirm-modal ${policyActionConfirmation.action === "delete" ? "is-delete" : "is-add"}`}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="policy-confirm-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="policy-confirm-icon" aria-hidden="true">
+              {policyActionConfirmation.action === "delete" ? (
+                <svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5" /></svg>
+              ) : (
+                <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg>
+              )}
+            </div>
+            <span className="policy-confirm-kicker">Policy configuration</span>
+            <h3 id="policy-confirm-title">{policyActionConfirmation.action === "delete" ? "Delete this policy entry?" : "Add this policy entry?"}</h3>
+            <p>
+              {policyActionConfirmation.action === "delete"
+                ? "This entry will be permanently removed from"
+                : "This entry will be added to"}{" "}
+              <strong>{POLICY_LIST_META[policyActionConfirmation.listKey] || "Policy rules"}</strong>.
+            </p>
+            <div className="policy-confirm-value">{policyActionConfirmation.value}</div>
+            {policyActionConfirmation.error ? <div className="policy-confirm-error" role="alert">{policyActionConfirmation.error}</div> : null}
+            <div className="policy-confirm-actions">
+              <button type="button" className="btn-sm" onClick={() => setPolicyActionConfirmation(null)} disabled={pendingKey === policyConfirmationPendingKey}>Cancel</button>
+              <button
+                type="button"
+                className={`btn-sm policy-confirm-submit ${policyActionConfirmation.action === "delete" ? "is-delete" : "is-add"}`}
+                onClick={confirmPolicyAction}
+                disabled={pendingKey === policyConfirmationPendingKey}
+              >
+                {pendingKey === policyConfirmationPendingKey
+                  ? policyActionConfirmation.action === "delete" ? "Deleting..." : "Adding..."
+                  : policyActionConfirmation.action === "delete" ? "Delete entry" : "Add entry"}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {policyEntryEditor ? (
+        <div className="admin-modal-overlay policy-entry-edit-overlay" onClick={() => setPolicyEntryEditor(null)}>
+          <form className="policy-entry-edit-modal" role="dialog" aria-modal="true" aria-labelledby="policy-entry-edit-title" onSubmit={savePolicyEntryEdit} onClick={(event) => event.stopPropagation()}>
+            <header className="policy-entry-edit-head">
+              <div>
+                <span>Policy configuration</span>
+                <h3 id="policy-entry-edit-title">Edit policy entry</h3>
+              </div>
+              <ModalCloseButton type="button" className="policy-entry-edit-close" onClick={() => setPolicyEntryEditor(null)} aria-label="Close edit policy entry" />
+            </header>
+
+            <div className="policy-entry-edit-body">
+              <div className="policy-entry-edit-context">
+                <span>Rule set</span>
+                <strong>{POLICY_LIST_META[policyEntryEditor.listKey] || "Policy rules"}</strong>
+              </div>
+              <label className="policy-entry-edit-field" htmlFor="policy-entry-edit-value">
+                <span>Word or phrase</span>
+                <input
+                  id="policy-entry-edit-value"
+                  autoFocus
+                  value={policyEntryEditor.value}
+                  onChange={(event) => setPolicyEntryEditor((prev) => ({ ...prev, value: event.target.value, error: "" }))}
+                  placeholder="Enter a word or phrase"
+                  aria-invalid={Boolean(policyEntryEditor.error)}
+                  aria-describedby="policy-entry-edit-help"
+                />
+              </label>
+              <p id="policy-entry-edit-help" className="policy-entry-edit-help">Use normal English words or phrases. Special pattern characters are not required.</p>
+              {policyEntryEditor.error ? <div className="policy-entry-edit-error" role="alert">{policyEntryEditor.error}</div> : null}
+            </div>
+
+            <footer className="policy-entry-edit-actions">
+              <button type="button" className="btn-sm" onClick={() => setPolicyEntryEditor(null)} disabled={pendingKey === `policy-edit-${policyEntryEditor.listKey}-${policyEntryEditor.index}`}>Cancel</button>
+              <button type="submit" className="btn-sm policy-entry-edit-save" disabled={pendingKey === `policy-edit-${policyEntryEditor.listKey}-${policyEntryEditor.index}`}>
+                {pendingKey === `policy-edit-${policyEntryEditor.listKey}-${policyEntryEditor.index}` ? "Saving..." : "Save changes"}
+              </button>
+            </footer>
+          </form>
+        </div>
+      ) : null}
+
+      {policyActionSuccess ? (
+        <div className="admin-modal-overlay policy-success-modal-overlay" onClick={() => setPolicyActionSuccess(null)}>
+          <section className="policy-success-modal" role="dialog" aria-modal="true" aria-labelledby="policy-success-modal-title" onClick={(event) => event.stopPropagation()}>
+            <ModalCloseButton type="button" className="policy-success-modal-close" onClick={() => setPolicyActionSuccess(null)} aria-label="Close success message" />
+            <div className="policy-success-modal-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="m5 12 4.2 4.2L19 6.5" /></svg>
+            </div>
+            <span className="policy-success-modal-kicker">Policy configuration</span>
+            <h3 id="policy-success-modal-title">{policyActionSuccess.title}</h3>
+            <p>The change is saved in <strong>{policyActionSuccess.listLabel}</strong> and applies to new prompts immediately.</p>
+            <div className="policy-success-modal-value">{policyActionSuccess.value}</div>
+            <button type="button" className="btn-sm policy-success-modal-done" onClick={() => setPolicyActionSuccess(null)}>Done</button>
+          </section>
+        </div>
+      ) : null}
+
+      {adminWindowsOsTest ? (
+        <div className="windows-os-modal-host helpdesk-root theme-light" role="dialog" aria-modal="true" aria-label="Windows OS simulation">
+          <div className="windows-os-modal">
+            <WindowsOsSimulation testMode
+              api={api}
+              moduleId={adminWindowsOsTest.id}
+              title={adminWindowsOsTest.title}
+              steps={adminWindowsOsTest.steps}
+              onEnded={() => setAdminWindowsOsTest(null)}
+            />
+          </div>
+        </div>
+      ) : null}
+
+      {userActionNotice ? (
+        <div className="admin-success-notice-overlay" role="status" aria-live="polite">
+          <div className="admin-success-notice-card">
+            <div className="admin-success-notice-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="m5 12 4.2 4.2L19 6.5" /></svg>
+            </div>
+            <div>
+              <strong>Success</strong>
+              <p>{userActionNotice}</p>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {userActionErrorNotice ? (
+        <div className="admin-success-notice-overlay admin-error-notice-overlay" role="alert" aria-live="assertive">
+          <div className="admin-success-notice-card admin-error-notice-card">
+            <div className="admin-success-notice-icon admin-error-notice-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M12 8v4M12 16h.01M10 3.8 2.8 16.2A2 2 0 0 0 4.5 19h15a2 2 0 0 0 1.7-2.8L14 3.8a2.3 2.3 0 0 0-4 0Z" /></svg>
+            </div>
+            <div>
+              <strong>Account update failed</strong>
+              <p>{userActionErrorNotice}</p>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {userPendingDeletion ? (
+        <div className="admin-modal-overlay admin-delete-confirm-overlay" onClick={() => setUserPendingDeletion(null)}>
+          <section className="admin-delete-confirm-card" role="dialog" aria-modal="true" aria-labelledby="delete-user-title" onClick={(event) => event.stopPropagation()}>
+            <div className="admin-delete-confirm-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5" /></svg>
+            </div>
+            <div>
+              <h3 id="delete-user-title">Delete user account?</h3>
+              <p>
+                You are about to permanently delete <strong>{userPendingDeletion.email}</strong>. This action cannot be undone.
+              </p>
+            </div>
+            <div className="admin-delete-confirm-actions">
+              <button type="button" className="btn-sm" onClick={() => setUserPendingDeletion(null)} disabled={pendingKey === `user-delete-${userPendingDeletion.id}`}>Cancel</button>
+              <button type="button" className="btn-sm admin-delete-confirm-button" onClick={() => deleteUserAccount(userPendingDeletion)} disabled={pendingKey === `user-delete-${userPendingDeletion.id}`}>
+                {pendingKey === `user-delete-${userPendingDeletion.id}` ? "Deleting..." : "Delete Account"}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {userModalOpen ? (
+        <div className="admin-modal-overlay" onClick={closeUserModal}>
+          <div className="admin-modal account-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="account-modal-head">
+              <div className="account-modal-head-left">
+                <div className="account-modal-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24">
+                    <path d="M12 5a4 4 0 1 1 0 8 4 4 0 0 1 0-8z" />
+                    <path d="M4.5 20a7.5 7.5 0 0 1 15 0" />
+                    <path d="M18.5 4.5v5M16 7h5" />
+                  </svg>
+                </div>
+                <div>
+                  <h3>{userModalMode === "create" ? "Create user account" : "Edit user account"}</h3>
+                  <p>
+                    {userModalMode === "create"
+                      ? "Fill in the details below to add a new user"
+                      : "Update user details and access settings"}
+                  </p>
+                </div>
+              </div>
+              <ModalCloseButton type="button" className="account-modal-close" onClick={closeUserModal} aria-label="Close" />
+            </div>
+
+            {userFormError ? <div className="admin-alert error">{userFormError}</div> : null}
+
+            <div className="account-modal-body">
+              <div className="admin-modal-grid account-modal-grid">
+                <label className="admin-field account-field">
+                <span>First Name</span>
+                <input name="admin-page-user-form-first-name"
+                  type="text"
+                  placeholder="e.g. Alex"
+                  value={userForm.firstName}
+                  onChange={(event) => setUserForm((prev) => ({ ...prev, firstName: event.target.value }))}
+                />
+              </label>
+                <label className="admin-field account-field">
+                <span>Last Name</span>
+                <input name="admin-page-user-form-last-name"
+                  type="text"
+                  placeholder="e.g. Rivera"
+                  value={userForm.lastName}
+                  onChange={(event) => setUserForm((prev) => ({ ...prev, lastName: event.target.value }))}
+                />
+              </label>
+                <label className="admin-field account-field full">
+                  <span>Email Address</span>
+                  <div className="account-input-icon-wrap">
+                    <span className="account-input-icon" aria-hidden="true">
+                      <svg viewBox="0 0 24 24">
+                        <path d="M3 6h18v12H3z" />
+                        <path d="m4 7 8 6 8-6" />
+                      </svg>
+                    </span>
+                    <input name="admin-page-user-form-email"
+                      type="email"
+                      placeholder="alex@company.com"
+                      className="account-input-with-icon"
+                      value={userForm.email}
+                      onChange={(event) => setUserForm((prev) => ({ ...prev, email: event.target.value }))}
+                    />
+                  </div>
+                </label>
+                <label className="admin-field account-field">
+                <span>Role</span>
+                <select name="admin-page-user-form-role"
+                  value={userForm.role}
+                  onChange={(event) => setUserForm((prev) => ({ ...prev, role: event.target.value }))}
+                >
+                  <option value="USER">USER</option>
+                  <option value="ADMIN">ADMIN</option>
+                </select>
+              </label>
+                <label className="admin-field account-field">
+                <span>Status</span>
+                <select name="admin-page-user-form-is-active"
+                  value={userForm.isActive ? "ACTIVE" : "INACTIVE"}
+                  onChange={(event) => setUserForm((prev) => ({ ...prev, isActive: event.target.value === "ACTIVE" }))}
+                >
+                  <option value="ACTIVE">ACTIVE</option>
+                  <option value="INACTIVE">INACTIVE</option>
+                </select>
+              </label>
+                <div className={`account-password-section full ${userModalMode === "create" && useDefaultPassword ? "is-disabled" : ""}`}>
+                  <div className="account-password-grid">
+                    <label className="admin-field account-field">
+                      <span>{userModalMode === "create" ? "Password" : "New Password (optional)"}</span>
+                      <div className="account-input-icon-wrap">
+                        <input name="admin-page-user-form-password"
+                          type={showCreatePassword ? "text" : "password"}
+                          placeholder={userModalMode === "create" ? "Min. 12 characters" : "Leave blank to keep current"}
+                          value={userForm.password}
+                          disabled={userModalMode === "create" && useDefaultPassword}
+                          onChange={(event) => setUserForm((prev) => ({ ...prev, password: event.target.value }))}
+                        />
+                        <button
+                          type="button"
+                          className="account-input-action"
+                          onClick={() => setShowCreatePassword((prev) => !prev)}
+                          aria-label={showCreatePassword ? "Hide password" : "Show password"}
+                        >
+                          {showCreatePassword ? (
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                              <path d="M3 3l18 18" />
+                              <path d="M10.8 10.8a2.2 2.2 0 0 0 3.1 3.1" />
+                              <path d="M9.9 5.2A10.8 10.8 0 0 1 12 5c4.9 0 8.8 3 10 7-0.4 1.4-1.2 2.7-2.3 3.8" />
+                              <path d="M6.2 6.2C4.6 7.4 3.4 9.1 2 12c1.2 4 5.1 7 10 7 1.1 0 2.1-0.1 3.1-0.4" />
+                            </svg>
+                          ) : (
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                              <path d="M2 12s3.8-7 10-7 10 7 10 7-3.8 7-10 7S2 12 2 12z" />
+                              <circle cx="12" cy="12" r="3" />
+                            </svg>
+                          )}
+                        </button>
+                      </div>
+                    </label>
+                    <label className="admin-field account-field">
+                      <span>{userModalMode === "create" ? "Confirm Password" : "Confirm New Password"}</span>
+                      <div className="account-input-icon-wrap">
+                        <input name="admin-page-user-form-confirm-password"
+                          type={showCreateConfirmPassword ? "text" : "password"}
+                          placeholder={userModalMode === "create" ? "Repeat password" : "Confirm new password"}
+                          value={userForm.confirmPassword}
+                          disabled={userModalMode === "create" && useDefaultPassword}
+                          onChange={(event) => setUserForm((prev) => ({ ...prev, confirmPassword: event.target.value }))}
+                        />
+                        <button
+                          type="button"
+                          className="account-input-action"
+                          onClick={() => setShowCreateConfirmPassword((prev) => !prev)}
+                          aria-label={showCreateConfirmPassword ? "Hide confirm password" : "Show confirm password"}
+                        >
+                          {showCreateConfirmPassword ? (
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                              <path d="M3 3l18 18" />
+                              <path d="M10.8 10.8a2.2 2.2 0 0 0 3.1 3.1" />
+                              <path d="M9.9 5.2A10.8 10.8 0 0 1 12 5c4.9 0 8.8 3 10 7-0.4 1.4-1.2 2.7-2.3 3.8" />
+                              <path d="M6.2 6.2C4.6 7.4 3.4 9.1 2 12c1.2 4 5.1 7 10 7 1.1 0 2.1-0.1 3.1-0.4" />
+                            </svg>
+                          ) : (
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                              <path d="M2 12s3.8-7 10-7 10 7 10 7-3.8 7-10 7S2 12 2 12z" />
+                              <circle cx="12" cy="12" r="3" />
+                            </svg>
+                          )}
+                        </button>
+                      </div>
+                    </label>
+                  </div>
+                  {showPasswordMatch ? (
+                    <div className={`account-password-match ${passwordMatch ? "ok" : "bad"}`}>
+                      {passwordMatch ? "Passwords match" : "Passwords do not match"}
+                    </div>
+                  ) : null}
+                </div>
+                {userModalMode === "create" ? (
+                  <label className="admin-inline-checkbox account-default-row full">
+                    <input name="admin-page-use-default-password"
+                      type="checkbox"
+                      checked={useDefaultPassword}
+                      onChange={(event) => {
+                        const checked = event.target.checked;
+                        const password = checked ? generateUserPassword() : "";
+                        setGeneratedUserPassword(password);
+                        setUseDefaultPassword(checked);
+                        setUserFormError("");
+                        setShowCreatePassword(false);
+                        setShowCreateConfirmPassword(false);
+                        setUserForm((prev) => ({
+                          ...prev,
+                          password,
+                          confirmPassword: password
+                        }));
+                      }}
+                    />
+                    <span>
+                      <strong>Use password123</strong>
+                      <em>
+                        Account will be created with <code>{generatedUserPassword}</code> and must be changed on first login
+                      </em>
+                    </span>
+                  </label>
+                ) : null}
+              </div>
+
+              <div className="account-modal-footer">
+                <div className={`account-preview-avatar ${previewFullName ? "has-name" : ""}`}>{previewInitials}</div>
+                <div className={`account-preview-name ${previewFullName ? "has-name" : ""}`}>
+                  {previewFullName || "Enter a name to preview"}
+                </div>
+                <button type="button" className="btn-sm" onClick={closeUserModal}>Cancel</button>
+                <button
+                  type="button"
+                  className="btn-sm create-user-btn"
+                  disabled={pendingKey === "user-modal-save"}
+                  onClick={saveUserModal}
+                >
+                  {pendingKey === "user-modal-save" ? "Saving..." : userModalMode === "create" ? "Create User" : "Save Changes"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {accountSettingsOpen ? (
+        <div className="admin-modal-overlay" onClick={closeAccountSettings}>
+          <form className="admin-modal admin-account-settings-modal" onSubmit={saveAccountPassword} onClick={(event) => event.stopPropagation()}>
+            <div className="account-modal-head">
+              <div className="account-modal-head-left">
+                <div className="account-modal-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24"><path d="M12 5a4 4 0 1 1 0 8 4 4 0 0 1 0-8z" /><path d="M4.5 20a7.5 7.5 0 0 1 15 0" /></svg>
+                </div>
+                <div>
+                  <h3>Account settings</h3>
+                  <p>Review your administrator account and update your password.</p>
+                </div>
+              </div>
+              <ModalCloseButton type="button" className="account-modal-close" onClick={closeAccountSettings} aria-label="Close account settings" />
+            </div>
+
+            <div className="admin-account-details">
+              <div className="admin-account-avatar">{(user?.firstName || user?.email || "A").charAt(0).toUpperCase()}</div>
+              <div>
+                <strong>{user?.firstName || ""} {user?.lastName || ""}</strong>
+                <span>{user?.email || ""}</span>
+              </div>
+              <em>{user?.role || "ADMIN"}</em>
+            </div>
+
+            <div className="account-modal-body admin-account-settings-body">
+              <h4>Change password</h4>
+              <p className="admin-account-password-note">Use at least 12 characters, at most 72 UTF-8 bytes, and avoid common passwords.</p>
+              {accountSettingsError ? <div className="admin-alert error">{accountSettingsError}</div> : null}
+              {accountSettingsSuccess ? <div className="admin-account-success">{accountSettingsSuccess}</div> : null}
+              <div className="admin-account-password-fields">
+                {[
+                  ["current", "Current password", "currentPassword", "current-password"],
+                  ["next", "New password", "newPassword", "new-password"],
+                  ["confirm", "Confirm new password", "confirmPassword", "new-password"]
+                ].map(([key, label, field, autoComplete]) => (
+                  <label className="admin-field" key={key}>
+                    <span>{label}</span>
+                    <span className="admin-password-input-wrap">
+                      <input name={`account-${field}`}
+                        type={accountPasswordVisibility[key] ? "text" : "password"}
+                        value={accountPasswordForm[field]}
+                        autoComplete={autoComplete}
+                        disabled={accountPasswordSaving}
+                        onChange={(event) => setAccountPasswordForm((prev) => ({ ...prev, [field]: event.target.value }))}
+                      />
+                      <button
+                        type="button"
+                        className="admin-password-visibility-btn"
+                        onClick={() => setAccountPasswordVisibility((prev) => ({ ...prev, [key]: !prev[key] }))}
+                        aria-label={accountPasswordVisibility[key] ? `Hide ${label.toLowerCase()}` : `Show ${label.toLowerCase()}`}
+                      >
+                        <PasswordVisibilityIcon visible={accountPasswordVisibility[key]} />
+                      </button>
+                    </span>
+                  </label>
+                ))}
+              </div>
+              <div className="admin-account-settings-actions">
+                <button type="button" className="btn-sm" onClick={closeAccountSettings} disabled={accountPasswordSaving}>Cancel</button>
+                <button type="submit" className="btn-sm create-user-btn" disabled={accountPasswordSaving}>
+                  {accountPasswordSaving ? "Updating..." : "Update password"}
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+      ) : null}
+    </div>
+  );
+}

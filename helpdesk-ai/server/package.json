@@ -1,0 +1,56 @@
+{
+  "name": "helpdesk-ai-server",
+  "version": "1.0.0",
+  "private": true,
+  "main": "src/server.js",
+  "scripts": {
+    "security:scan-new-secrets": "node scripts/scan-new-secrets.js",
+    "test:security-baseline": "node scripts/test-security-baseline.js",
+    "dev": "nodemon src/server.js",
+    "migrate": "node scripts/migrate-as-owner.js dev",
+    "seed": "node prisma/seed.js",
+    "generate": "prisma generate",
+    "test": "node --test test/*.test.js",
+    "migrate:deploy": "node scripts/migrate-as-owner.js",
+    "start": "node src/server.js",
+    "test:db": "node --test test/database.integration.js",
+    "security:flag-legacy-passwords": "node scripts/flag-legacy-passwords.js",
+    "lint": "node scripts/check-syntax.js",
+    "test:review-db": "node --test test/review.database.integration.js",
+    "security:rotate-legacy-passwords": "node scripts/rotate-legacy-passwords.js --apply",
+    "diagnose:db": "node scripts/diagnose-db.js",
+    "backup:encrypted": "node scripts/secure-backup.js",
+    "backup:verify": "node scripts/test-backup-restore.js",
+    "security:verify-db": "node scripts/verify-security-db.js",
+    "security:verify-api": "node scripts/verify-api-security.js",
+    "security:scan-history": "node scripts/scan-repository-secrets.js",
+    "security:provision-db": "node scripts/provision-runtime-role.js --apply",
+    "test:persistence": "node --test test/durablePersistence.integration.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-ec2": "^3.1095.0",
+    "@prisma/client": "^6.8.2",
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "express-validator": "^7.2.1",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "openai": "^4.83.0",
+    "prisma": "^6.8.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  },
+  "engines": {
+    "node": ">=22.12 <25"
+  },
+  "overrides": {
+    "deepmerge-ts": "^8.0.0",
+    "minimatch": "^11.0.1",
+    "qs": "^6.16.1"
+  }
+}
